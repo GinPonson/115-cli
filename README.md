@@ -182,6 +182,56 @@ uv run u115 upload "/path/to/file.bin" --cid 123456
 `--search` 已经检索整个账号，不能与路径、`--cid` 或 `--recursive` 同时使用。
 文件夹命令与登录、上传命令共用 OAuth 登录态，也支持 `--tokens` 指定其他登录态文件。
 
+## 文件列表与校验
+
+分页列出根目录中的文件；默认只读取前 100 条，避免大目录一次性加载：
+
+```bash
+uv run u115 files
+```
+
+列出指定路径或 CID 中的文件：
+
+```bash
+uv run u115 files "/备份/照片"
+uv run u115 files --cid 123456
+```
+
+指定分页偏移和单页大小：
+
+```bash
+uv run u115 files --cid 123456 --offset 100 --limit 200
+```
+
+每页结束后，终端会在错误输出中显示匹配总数；如果还有下一页，也会给出可直接使用的
+`--offset` 和 `--limit` 参数。`--limit` 范围为 1–1150。
+
+确认确实需要读取剩余全部文件时，显式添加 `--all`：
+
+```bash
+uv run u115 files --cid 123456 --limit 500 --all
+```
+
+按文件名在整个 115 账号中分页搜索：
+
+```bash
+uv run u115 files --search "年度报告" --limit 100
+```
+
+也可以从指定 offset 开始读取全部剩余搜索结果：
+
+```bash
+uv run u115 files --search ".iso" --offset 500 --limit 500 --all
+```
+
+输出为 Tab 分隔的 `FILE_ID`、`PARENT_CID`、`SIZE`、`SHA1`、`NAME` 五列，
+方便使用 `awk`、重定向或其他脚本进行数量、大小与 SHA1 校验。文件名中的 Tab、回车和
+换行会转义，不会破坏表格结构。
+
+`--search` 不能与目录路径或 `--cid` 同时使用。文件列表只返回指定目录的直接文件，
+不会隐式递归进入子文件夹；需要核对其他目录时，可先使用 `u115 folders --recursive`
+取得对应 CID。
+
 查看完整参数：
 
 ```bash
@@ -189,6 +239,7 @@ uv run u115 --help
 uv run u115 login --help
 uv run u115 upload --help
 uv run u115 folders --help
+uv run u115 files --help
 ```
 
 ## 测试

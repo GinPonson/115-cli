@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from u115_uploader import cli
-from u115_uploader.uploader import RemoteFolder
+from u115_uploader.uploader import RemoteFile, RemoteFilePage, RemoteFolder
 
 
 def test_load_tokens_uses_local_auth_flow(
@@ -126,3 +126,50 @@ def test_folders_parser_supports_path_recursive_and_search() -> None:
     assert recursive.path == "/相册"
     assert recursive.recursive is True
     assert search.search == "旅行"
+
+
+def test_files_parser_defaults_to_bounded_page_and_supports_search() -> None:
+    """files 默认只读取 100 条，并允许显式指定分页或全量检索。"""
+    parser = cli.build_parser()
+
+    default_page = parser.parse_args(["files", "/视频"])
+    search_all = parser.parse_args(
+        ["files", "--search", "校验", "--offset", "100", "--limit", "200", "--all"]
+    )
+
+    assert default_page.path == "/视频"
+    assert default_page.offset == 0
+    assert default_page.limit == 100
+    assert default_page.all is False
+    assert search_all.search == "校验"
+    assert search_all.offset == 100
+    assert search_all.limit == 200
+    assert search_all.all is True
+
+
+def test_print_remote_file_page_escapes_names_and_deduplicates(
+    capsys,
+) -> None:
+    """文件表格应转义控制字符，并避免跨页重复输出同一文件。"""
+    page = RemoteFilePage(
+        files=(
+            RemoteFile(
+                file_id=1,
+                parent_cid=0,
+                name="报告\t最终\n版.txt",
+                size=12,
+                sha1="ABC",
+            ),
+        ),
+        offset=0,
+        limit=100,
+        total=1,
+        next_offset=None,
+    )
+    seen: set[int] = set()
+
+    assert cli.print_remote_file_page(page, seen=seen) == 1
+    assert cli.print_remote_file_page(page, seen=seen) == 0
+
+    output = capsys.readouterr().out
+    assert output == "1\t0\t12\tABC\t报告\\t最终\\n版.txt\n"

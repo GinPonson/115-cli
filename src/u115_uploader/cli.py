@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-from .uploader import OpenUploader, RemoteFolder, upload_file
+from .uploader import OpenUploader, RemoteFilePage, RemoteFolder, upload_file
 from .auth import OpenAuthClient, TokenStore
 
 DEFAULT_TOKEN_PATH = Path.home() / ".config" / "u115-uploader" / "tokens.json"
@@ -49,6 +49,45 @@ def positive_mebibytes(value: str) -> int:
     if size <= 0:
         raise argparse.ArgumentTypeError("必须大于 0")
     return size * 1024 * 1024
+
+
+def nonnegative_integer(value: str) -> int:
+    """解析用于 CID 和 offset 的非负整数参数。
+
+    Args:
+        value: argparse 收到的字符串。
+
+    Returns:
+        大于等于零的整数。
+
+    Raises:
+        argparse.ArgumentTypeError: 输入不是非负整数。
+    """
+    try:
+        number = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("必须是整数") from error
+    if number < 0:
+        raise argparse.ArgumentTypeError("不能为负数")
+    return number
+
+
+def file_page_limit(value: str) -> int:
+    """解析 115 文件列表的单页大小。
+
+    Args:
+        value: argparse 收到的字符串。
+
+    Returns:
+        1 到 1150 之间的单页条数。
+
+    Raises:
+        argparse.ArgumentTypeError: 输入不是允许范围内的整数。
+    """
+    limit = nonnegative_integer(value)
+    if not 1 <= limit <= 1150:
+        raise argparse.ArgumentTypeError("必须在 1 到 1150 之间")
+    return limit
 
 
 def _files_in_directory(directory: Path) -> list[Path]:
@@ -190,6 +229,30 @@ def _terminal_field(value: object) -> str:
     )
 
 
+def print_remote_file_page(page: RemoteFilePage, *, seen: set[int]) -> int:
+    """输出一页远端文件，并跨页过滤重复文件 ID。
+
+    Args:
+        page: 已标准化的 115 文件页。
+        seen: 当前命令已经输出的文件 ID 集合。
+
+    Returns:
+        本页实际输出的文件数量。
+    """
+    printed = 0
+    for remote_file in page.files:
+        if remote_file.file_id in seen:
+            continue
+        seen.add(remote_file.file_id)
+        print(
+            f"{remote_file.file_id}\t{remote_file.parent_cid}\t"
+            f"{remote_file.size}\t{_terminal_field(remote_file.sha1)}\t"
+            f"{_terminal_field(remote_file.name)}"
+        )
+        printed += 1
+    return printed
+
+
 def build_parser() -> argparse.ArgumentParser:
     """创建 CLI 参数解析器。"""
     parser = argparse.ArgumentParser(
@@ -260,7 +323,49 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="KEYWORD",
         help="按名称在整个 115 账号中搜索文件夹",
     )
-    for command_parser in (login_parser, upload_parser, folders_parser):
+    files_parser = subparsers.add_parser(
+        "files",
+        help="分页列出或搜索 115 文件",
+    )
+    files_parser.add_argument(
+        "path",
+        nargs="?",
+        default="/",
+        help="要列出的 115 绝对目录路径，默认根目录",
+    )
+    files_parser.add_argument(
+        "--cid",
+        type=nonnegative_integer,
+        help="直接指定要列出文件的父目录 CID",
+    )
+    files_parser.add_argument(
+        "--offset",
+        type=nonnegative_integer,
+        default=0,
+        help="分页偏移，默认 0",
+    )
+    files_parser.add_argument(
+        "--limit",
+        type=file_page_limit,
+        default=100,
+        help="单页条数，范围 1-1150，默认 100",
+    )
+    files_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="从 offset 开始自动读取全部剩余页",
+    )
+    files_parser.add_argument(
+        "--search",
+        metavar="KEYWORD",
+        help="按名称在整个 115 账号中搜索文件",
+    )
+    for command_parser in (
+        login_parser,
+        upload_parser,
+        folders_parser,
+        files_parser,
+    ):
         command_parser.add_argument(
             "--tokens",
             type=Path,
@@ -350,6 +455,57 @@ def run(argv: Sequence[str] | None = None) -> int:
                         f"{folder.cid}\t{folder.parent_cid}\t"
                         f"{_terminal_field(folder_path)}"
                     )
+            return 0
+
+        if args.command == "files":
+            if args.cid is not None and args.path != "/":
+                raise ValueError("文件路径与 --cid 不能同时指定")
+            if args.search is not None and (args.cid is not None or args.path != "/"):
+                raise ValueError("--search 不能与目录路径或 --cid 同时使用")
+
+            tokens = load_tokens(token_path)
+            uploader = OpenUploader(tokens.access_token)
+            parent_cid = (
+                args.cid
+                if args.cid is not None
+                else uploader.resolve_remote_dir(args.path)
+            )
+            current_offset = args.offset
+            seen: set[int] = set()
+            shown = 0
+            total = 0
+            next_offset: int | None = current_offset
+            print("FILE_ID\tPARENT_CID\tSIZE\tSHA1\tNAME")
+
+            while next_offset is not None:
+                page = (
+                    uploader.search_files_page(
+                        args.search,
+                        offset=current_offset,
+                        limit=args.limit,
+                    )
+                    if args.search is not None
+                    else uploader.list_files_page(
+                        parent_cid,
+                        offset=current_offset,
+                        limit=args.limit,
+                    )
+                )
+                shown += print_remote_file_page(page, seen=seen)
+                total = page.total
+                next_offset = page.next_offset
+                if not args.all or next_offset is None:
+                    break
+                if next_offset <= current_offset:
+                    raise RuntimeError("115 文件列表分页偏移未前进")
+                current_offset = next_offset
+
+            summary = f"已显示 {shown} 个文件；匹配总数 {total}"
+            if next_offset is not None:
+                summary += (
+                    f"；下一页：--offset {next_offset} --limit {args.limit}"
+                )
+            print(summary, file=sys.stderr)
             return 0
 
         # 登录态不存在时主动生成二维码；登录成功后 OAuth tokens 会写回文件。

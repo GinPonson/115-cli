@@ -235,3 +235,88 @@ def test_search_folders_uses_global_folder_search_shape() -> None:
     ]
     assert captured["search_value"] == "旅行"
     assert captured["fc"] == "1"
+
+
+def test_list_files_page_returns_pagination_metadata() -> None:
+    """文件列表应只请求文件，并根据原始页长度计算下一页 offset。"""
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(dict(request.url.params))
+        return httpx.Response(
+            200,
+            json={
+                "state": True,
+                "count": 3,
+                "data": [
+                    {
+                        "fid": "101",
+                        "cid": "9",
+                        "n": "a.txt",
+                        "s": "12",
+                        "sha": "abc",
+                    },
+                    {
+                        "fid": "102",
+                        "cid": "9",
+                        "n": "b.txt",
+                        "s": "34",
+                        "sha": "def",
+                    },
+                ],
+            },
+        )
+
+    uploader = OpenUploader(
+        "token",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    page = uploader.list_files_page(9, offset=0, limit=2)
+
+    assert [(item.file_id, item.name, item.size, item.sha1) for item in page.files] == [
+        (101, "a.txt", 12, "ABC"),
+        (102, "b.txt", 34, "DEF"),
+    ]
+    assert page.total == 3
+    assert page.next_offset == 2
+    assert captured["show_dir"] == "0"
+    assert captured["limit"] == "2"
+
+
+def test_search_files_page_uses_file_filter_and_search_schema() -> None:
+    """文件搜索应传 fc=2，并解析完整字段名和结束页状态。"""
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(dict(request.url.params))
+        return httpx.Response(
+            200,
+            json={
+                "state": True,
+                "count": 1,
+                "data": [
+                    {
+                        "file_id": "201",
+                        "parent_id": "20",
+                        "file_name": "校验文件.bin",
+                        "file_size": "4096",
+                        "sha1": "123abc",
+                        "file_category": "1",
+                    }
+                ],
+            },
+        )
+
+    uploader = OpenUploader(
+        "token",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    page = uploader.search_files_page("校验", offset=0, limit=100)
+
+    assert page.files[0].parent_cid == 20
+    assert page.files[0].sha1 == "123ABC"
+    assert page.next_offset is None
+    assert captured["search_value"] == "校验"
+    assert captured["fc"] == "2"

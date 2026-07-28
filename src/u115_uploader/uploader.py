@@ -43,6 +43,44 @@ class RemoteFolder:
     name: str
 
 
+@dataclass(frozen=True, slots=True)
+class RemoteFile:
+    """115 文件列表中的标准化文件条目。
+
+    Attributes:
+        file_id: 文件自身 ID。
+        parent_cid: 父文件夹 CID。
+        name: 文件名称。
+        size: 文件大小，单位为字节。
+        sha1: 115 返回的大写 SHA1；接口未提供时为空字符串。
+    """
+
+    file_id: int
+    parent_cid: int
+    name: str
+    size: int
+    sha1: str
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteFilePage:
+    """115 文件列表的单页结果。
+
+    Attributes:
+        files: 当前页的文件条目。
+        offset: 当前页请求偏移。
+        limit: 当前页请求大小。
+        total: 当前筛选条件下的文件总数。
+        next_offset: 下一页偏移；没有下一页时为 ``None``。
+    """
+
+    files: tuple[RemoteFile, ...]
+    offset: int
+    limit: int
+    total: int
+    next_offset: int | None
+
+
 def _hash_file(path: Path) -> tuple[str, str]:
     """单次顺序读取，同时计算整文件和前 128 KiB 的大写 SHA1。"""
     full = hashlib.sha1()
@@ -310,6 +348,250 @@ class OpenUploader:
             },
             expected_parent_cid=None,
         )
+
+    def list_files_page(
+        self,
+        parent_cid: int = 0,
+        *,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> RemoteFilePage:
+        """分页列出指定 115 目录中的直接文件，不包含子文件夹。
+
+        Args:
+            parent_cid: 父目录 CID；根目录为 0。
+            offset: 从零开始的分页偏移。
+            limit: 单页条数，范围为 1 到 1150。
+
+        Returns:
+            包含总数和下一页偏移的标准化文件页。
+
+        Raises:
+            ValueError: CID、offset 或 limit 超出允许范围。
+            UploadError: 请求失败或响应字段不符合接口契约。
+        """
+        self._validate_file_page(parent_cid=parent_cid, offset=offset, limit=limit)
+        return self._request_file_page(
+            f"{PRO_API}/open/ufile/files",
+            {
+                "aid": 1,
+                "cid": str(parent_cid),
+                "o": "file_name",
+                "asc": 1,
+                "offset": offset,
+                "limit": limit,
+                # 对齐 StarVault：show_dir=0 仅返回当前目录中的文件。
+                "show_dir": 0,
+                "fc_mix": 0,
+                "count_folders": 0,
+            },
+            requested_offset=offset,
+            requested_limit=limit,
+            expected_parent_cid=parent_cid,
+        )
+
+    def search_files_page(
+        self,
+        query: str,
+        *,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> RemoteFilePage:
+        """分页按名称搜索整个 115 账号中的文件。
+
+        Args:
+            query: 非空文件名关键词，由 115 执行子串匹配。
+            offset: 从零开始的分页偏移。
+            limit: 单页条数，范围为 1 到 1150。
+
+        Returns:
+            包含总数和下一页偏移的标准化搜索结果页。
+
+        Raises:
+            ValueError: 关键词为空，或分页参数超出允许范围。
+            UploadError: 请求失败或响应字段不符合接口契约。
+        """
+        query = query.strip()
+        if not query:
+            raise ValueError("文件搜索关键词不能为空")
+        self._validate_file_page(parent_cid=0, offset=offset, limit=limit)
+        return self._request_file_page(
+            f"{PRO_API}/open/ufile/search",
+            {
+                "search_value": query,
+                "aid": 1,
+                "cid": "0",
+                "o": "file_name",
+                "asc": 1,
+                "offset": offset,
+                "limit": limit,
+                "show_dir": 0,
+                "fc_mix": 0,
+                "count_folders": 0,
+                # 115 搜索接口 fc=2 表示只返回文件。
+                "fc": 2,
+            },
+            requested_offset=offset,
+            requested_limit=limit,
+            expected_parent_cid=None,
+        )
+
+    @staticmethod
+    def _validate_file_page(*, parent_cid: int, offset: int, limit: int) -> None:
+        """校验文件分页参数，防止无界或无效请求进入 115 接口。
+
+        Args:
+            parent_cid: 父目录 CID。
+            offset: 分页偏移。
+            limit: 单页条数。
+
+        Raises:
+            ValueError: 任一参数超出允许范围。
+        """
+        if parent_cid < 0:
+            raise ValueError("父目录 CID 不能为负数")
+        if offset < 0:
+            raise ValueError("文件列表 offset 不能为负数")
+        if not 1 <= limit <= 1150:
+            raise ValueError("文件列表 limit 必须在 1 到 1150 之间")
+
+    def _request_file_page(
+        self,
+        url: str,
+        params: dict[str, Any],
+        *,
+        requested_offset: int,
+        requested_limit: int,
+        expected_parent_cid: int | None,
+    ) -> RemoteFilePage:
+        """请求并严格解析一页 115 文件列表。
+
+        Args:
+            url: 文件列表或搜索端点。
+            params: 完整查询参数。
+            requested_offset: 调用方请求的 offset。
+            requested_limit: 调用方请求的 limit。
+            expected_parent_cid: 目录列表已知的父 CID；搜索时为 ``None``。
+
+        Returns:
+            标准化文件页。
+
+        Raises:
+            UploadError: HTTP、业务状态、分页字段或文件字段无效。
+        """
+        try:
+            response = self.http.request(
+                "GET",
+                url,
+                headers=self.headers,
+                params=params,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except (httpx.HTTPError, ValueError) as error:
+            raise UploadError("读取 115 文件列表失败") from error
+        if not isinstance(payload, dict) or payload.get("state") not in (True, 1):
+            message = payload.get("error") if isinstance(payload, dict) else None
+            raise UploadError(str(message or "读取 115 文件列表失败"))
+        items = payload.get("data")
+        if not isinstance(items, list):
+            raise UploadError("115 文件列表响应格式无效")
+        try:
+            total = int(payload.get("count") or 0)
+        except (TypeError, ValueError) as error:
+            raise UploadError("115 返回了无效的文件总数") from error
+
+        files: list[RemoteFile] = []
+        seen: set[int] = set()
+        for item in items:
+            if not isinstance(item, dict):
+                raise UploadError("115 文件条目响应格式无效")
+            parsed = self._parse_file_item(
+                item,
+                expected_parent_cid=expected_parent_cid,
+            )
+            # 接口偶尔混入文件夹；只过滤类型，不掩盖真实文件的字段错误。
+            if parsed is not None and parsed.file_id not in seen:
+                seen.add(parsed.file_id)
+                files.append(parsed)
+
+        consumed = len(items)
+        next_offset = requested_offset + consumed
+        if consumed == 0 or next_offset >= total:
+            next_offset = None
+        return RemoteFilePage(
+            files=tuple(files),
+            offset=requested_offset,
+            limit=requested_limit,
+            total=total,
+            next_offset=next_offset,
+        )
+
+    @staticmethod
+    def _parse_file_item(
+        item: dict[str, Any],
+        *,
+        expected_parent_cid: int | None,
+    ) -> RemoteFile | None:
+        """兼容 115 列表与搜索字段并转换单个文件条目。
+
+        Args:
+            item: 115 返回的文件或文件夹对象。
+            expected_parent_cid: 已知父 CID；全局搜索时为 ``None``。
+
+        Returns:
+            文件对应的 ``RemoteFile``；文件夹返回 ``None``。
+
+        Raises:
+            UploadError: 文件缺少 ID、名称、父 CID或大小字段。
+        """
+        search_schema = "file_name" in item
+        compact_schema = "fn" in item
+        if search_schema:
+            is_file = str(item.get("file_category", "1")) != "0"
+        elif compact_schema:
+            is_file = str(item.get("fc")) != "0"
+        else:
+            is_file = "fid" in item
+        if not is_file:
+            return None
+        try:
+            raw_name = (
+                item.get("file_name")
+                if search_schema
+                else item.get("fn") if compact_schema else item.get("n")
+            )
+            name = str(raw_name or "")
+            file_id = item["file_id"] if search_schema else item["fid"]
+            raw_parent = (
+                expected_parent_cid
+                if expected_parent_cid is not None
+                else item.get("parent_id", item.get("pid", item.get("cid")))
+            )
+            raw_size = (
+                item.get("file_size", 0)
+                if search_schema
+                else item.get("fs", 0) if compact_schema else item.get("s", 0)
+            )
+            raw_sha1 = (
+                item.get("sha1", "")
+                if search_schema or compact_schema
+                else item.get("sha", "")
+            )
+            if not name or raw_parent is None:
+                raise KeyError("name or parent cid")
+            size = int(raw_size or 0)
+            if size < 0:
+                raise ValueError("negative file size")
+            return RemoteFile(
+                file_id=int(file_id),
+                parent_cid=int(raw_parent),
+                name=name,
+                size=size,
+                sha1=str(raw_sha1 or "").upper(),
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise UploadError("115 返回了无效的文件字段") from error
 
     def _list_folders(
         self,
