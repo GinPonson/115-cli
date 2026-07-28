@@ -84,13 +84,42 @@ uv run u115 upload /path/to/file.bin
 uv run u115 upload /path/to/file.bin --remote-dir "/备份/照片"
 ```
 
-也支持把远端目录放在最后，并一次上传通配符匹配的多个文件：
+递归上传文件夹中的全部普通文件：
 
 ```bash
-uv run u115 upload ~/Downloads/漫喫*.mp4 /starvault-batch-test
+uv run u115 upload "/path/to/照片文件夹" --remote-dir "/备份/照片"
 ```
 
-Shell 会先展开通配符，程序随后按顺序逐个上传所有匹配文件。
+文件夹层级仅用于查找本地文件；所有文件仍上传到同一个 115 目标目录，不会自动创建远端子目录。
+
+使用通配符上传；建议用引号阻止 Shell 提前展开，由程序统一处理 `*`、`?` 和
+递归匹配 `**`：
+
+```bash
+uv run u115 upload "~/Downloads/**/*.mp4" --remote-dir "/视频"
+```
+
+同一个文件被多个参数或模式重复匹配时只会上传一次。通配符没有匹配项、文件夹为空或
+输入路径不存在时，命令会明确报错。
+
+空格、中文和通配符元字符等特殊字符文件名应使用引号。已存在的路径会优先按字面处理，
+因此下例中的方括号、星号和问号不会被当作通配符：
+
+```bash
+uv run u115 upload "/path/to/报告 [最终]*?.pdf"
+```
+
+文件名以 `-` 开头时，在文件参数前使用 `--` 结束选项解析：
+
+```bash
+uv run u115 upload -- "-特殊文件.txt"
+```
+
+也支持把远端目录放在最后：
+
+```bash
+uv run u115 upload "~/Downloads/漫喫*.mp4" /starvault-batch-test
+```
 
 远端路径必须：
 

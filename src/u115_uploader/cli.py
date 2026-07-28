@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import os
 import sys
 from pathlib import Path
@@ -50,6 +51,83 @@ def positive_mebibytes(value: str) -> int:
     return size * 1024 * 1024
 
 
+def _files_in_directory(directory: Path) -> list[Path]:
+    """递归列出目录中的全部普通文件。
+
+    Args:
+        directory: 已确认存在的本地目录。
+
+    Returns:
+        按路径稳定排序的绝对文件路径列表。
+
+    Raises:
+        ValueError: 目录中没有可上传的普通文件。
+        OSError: 遍历目录时发生权限或文件系统错误。
+    """
+    files = sorted(
+        (path.resolve() for path in directory.rglob("*") if path.is_file()),
+        key=os.fspath,
+    )
+    if not files:
+        raise ValueError(f"指定文件夹中没有可上传的文件：{directory}")
+    return files
+
+
+def expand_upload_sources(sources: Sequence[Path]) -> list[Path]:
+    """把文件、目录和通配符统一展开为去重后的普通文件列表。
+
+    Args:
+        sources: CLI 接收的本地路径或通配符表达式；已存在路径优先按字面处理。
+
+    Returns:
+        保持参数顺序、目录内稳定排序且去重后的绝对文件路径列表。
+
+    Raises:
+        FileNotFoundError: 普通路径不存在，或通配符没有匹配任何路径。
+        ValueError: 输入不是普通文件/目录，或目录中没有普通文件。
+        OSError: 读取路径或遍历目录失败。
+    """
+    expanded: list[Path] = []
+    seen: set[Path] = set()
+
+    for source in sources:
+        literal = source.expanduser()
+        if literal.exists():
+            matches = [literal]
+        else:
+            pattern = os.path.expanduser(os.fspath(source))
+            if not glob.has_magic(pattern):
+                raise FileNotFoundError(f"指定路径不存在：{literal.resolve()}")
+            # include_hidden=True 让显式目录上传与 ** 通配符对隐藏文件的行为保持一致。
+            matches = [
+                Path(match)
+                for match in glob.glob(
+                    pattern,
+                    recursive=True,
+                    include_hidden=True,
+                )
+            ]
+            if not matches:
+                raise FileNotFoundError(f"通配符未匹配任何路径：{source}")
+
+        for match in matches:
+            resolved = match.resolve()
+            if resolved.is_dir():
+                candidates = _files_in_directory(resolved)
+            elif resolved.is_file():
+                candidates = [resolved]
+            else:
+                raise ValueError(f"指定路径不是普通文件或文件夹：{resolved}")
+
+            for candidate in candidates:
+                # 同一文件可能同时被目录和通配符命中；只上传一次以避免副作用。
+                if candidate not in seen:
+                    seen.add(candidate)
+                    expanded.append(candidate)
+
+    return expanded
+
+
 def build_parser() -> argparse.ArgumentParser:
     """创建 CLI 参数解析器。"""
     parser = argparse.ArgumentParser(
@@ -71,7 +149,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="将认证二维码同时导出为 PNG 图片",
     )
     upload_parser = subparsers.add_parser("upload", help="上传一个或多个本地文件")
-    upload_parser.add_argument("files", nargs="+", type=Path, help="要上传的本地文件")
+    upload_parser.add_argument(
+        "files",
+        nargs="+",
+        type=Path,
+        help="要上传的文件、文件夹或通配符；文件夹将递归上传",
+    )
     destination = upload_parser.add_mutually_exclusive_group()
     destination.add_argument(
         "--cid",
@@ -143,10 +226,11 @@ def run(argv: Sequence[str] | None = None) -> int:
 
         # 登录态不存在时主动生成二维码；登录成功后 OAuth tokens 会写回文件。
         # 已有 access token 临近过期时，认证模块会先刷新并原子保存新令牌。
+        sources = expand_upload_sources(args.files)
         tokens = load_tokens(token_path)
-        for index, source in enumerate(args.files, start=1):
-            if len(args.files) > 1:
-                print(f"[{index}/{len(args.files)}] 准备上传：{source}")
+        for index, source in enumerate(sources, start=1):
+            if len(sources) > 1:
+                print(f"[{index}/{len(sources)}] 准备上传：{source}")
             result = upload_file(
                 tokens.access_token,
                 source,
