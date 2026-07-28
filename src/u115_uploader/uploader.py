@@ -780,10 +780,7 @@ class OpenUploader:
 
         upload_id = ""
         try:
-            upload_id = bucket.init_multipart_upload(
-                object_key,
-                headers=headers,
-            ).upload_id
+            upload_id = bucket.init_multipart_upload(object_key).upload_id
             parts: list[oss2.models.PartInfo] = []
             with source.open("rb") as stream:
                 part_number = 1
@@ -797,7 +794,14 @@ class OpenUploader:
                     parts.append(oss2.models.PartInfo(part_number, result.etag, size=len(chunk)))
                     progress.add(len(chunk))
                     part_number += 1
-            bucket.complete_multipart_upload(object_key, upload_id, parts)
+            # OSS 仅在 CompleteMultipartUpload 收到 callback 头时通知 115 入库；
+            # 放在初始化请求只会合并 OSS 对象，115 文件列表不会出现该文件。
+            bucket.complete_multipart_upload(
+                object_key,
+                upload_id,
+                parts,
+                headers=headers,
+            )
         except BaseException:
             # 已创建会话但未完成时明确中止，避免遗留无主 OSS 分片占用空间。
             if upload_id:

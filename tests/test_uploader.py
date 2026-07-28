@@ -24,6 +24,8 @@ class FakeBucket:
 
     def __init__(self) -> None:
         self.put_headers = None
+        self.init_headers = None
+        self.complete_headers = None
         self.parts = []
         self.completed = False
 
@@ -33,10 +35,10 @@ class FakeBucket:
         self.content = stream.read()
         self.put_headers = headers
 
-    def init_multipart_upload(self, key, *, headers):
+    def init_multipart_upload(self, key, *, headers=None):
         """返回固定 multipart upload id。"""
         self.key = key
-        self.put_headers = headers
+        self.init_headers = headers
         return FakeInitResult()
 
     def upload_part(self, key, upload_id, part_number, chunk):
@@ -44,9 +46,10 @@ class FakeBucket:
         self.parts.append((part_number, bytes(chunk)))
         return FakePutResult()
 
-    def complete_multipart_upload(self, key, upload_id, parts):
-        """标记 multipart 完成。"""
+    def complete_multipart_upload(self, key, upload_id, parts, *, headers=None):
+        """记录完成请求及其 115 入库回调头。"""
         self.completed = True
+        self.complete_headers = headers
 
     def abort_multipart_upload(self, key, upload_id):
         """测试正常路径不应调用中止。"""
@@ -122,6 +125,59 @@ def test_upload_handles_closed_range_sign_and_single_put(tmp_path: Path) -> None
     assert "sign_val=924F61661A3472DA74307A35F2C8D22E07E84A4D" in requests[1].content.decode()
     assert bucket.content == b"abcdef"
     assert "x-oss-callback" in bucket.put_headers
+
+
+def test_multipart_callback_is_sent_when_completing_upload(tmp_path: Path) -> None:
+    """分片 callback 必须随 CompleteMultipartUpload 发送，确保 115 收到入库通知。"""
+    source = tmp_path / "multipart.bin"
+    source.write_bytes(b"a" * (200 * 1024))
+    bucket = FakeBucket()
+    responses = iter(
+        [
+            {
+                "state": True,
+                "data": {
+                    "status": 1,
+                    "bucket": "bucket",
+                    "object": "object",
+                    "callback": {
+                        "callback": "callback",
+                        "callback_var": "vars",
+                    },
+                },
+            },
+            {
+                "state": True,
+                "data": {
+                    "endpoint": "https://oss.example.com",
+                    "AccessKeyId": "id",
+                    "AccessKeySecret": "secret",
+                    "SecurityToken": "sts",
+                },
+            },
+        ]
+    )
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=next(responses))
+
+    uploader = OpenUploader(
+        "token",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        bucket_factory=lambda *_args: bucket,
+    )
+
+    result = uploader.upload(
+        source,
+        part_size=100 * 1024,
+        progress_output=lambda _line: None,
+    )
+
+    assert result.instant is False
+    assert bucket.init_headers is None
+    assert bucket.completed is True
+    assert "x-oss-callback" in bucket.complete_headers
+    assert "x-oss-callback-var" in bucket.complete_headers
 
 
 def test_resolve_remote_directory_path_level_by_level() -> None:
