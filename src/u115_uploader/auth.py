@@ -15,6 +15,7 @@ import base64
 import hashlib
 import json
 import os
+import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -23,7 +24,7 @@ from typing import Any, Callable
 import httpx
 import qrcode
 
-CLIENT_ID = "100195125"
+CLIENT_ID = "100195137"
 CODE_VERIFIER = "0" * 64
 CODE_CHALLENGE = base64.b64encode(
     hashlib.sha256(CODE_VERIFIER.encode("ascii")).digest()
@@ -175,9 +176,11 @@ class OpenAuthClient:
             raise AuthenticationError("115 未返回完整的二维码登录信息")
 
         self._output("请使用 115 App 扫描二维码并确认登录：")
-        qr = qrcode.QRCode(border=1)
+        # 保留标准要求的 4 模块静区，避免二维码紧贴终端字符而无法被相机定位。
+        qr = qrcode.QRCode(border=4)
         qr.add_data(qrcode_url)
-        qr.print_ascii(out=None)
+        # TTY 模式会显式设置前景色与背景色，避免深色终端把二维码显示成反色。
+        qr.print_ascii(out=None, tty=sys.stdout.isatty())
         if self._qr_output is not None:
             self._save_qr_image(qr, self._qr_output)
             self._output(f"二维码图片已保存：{self._qr_output}")

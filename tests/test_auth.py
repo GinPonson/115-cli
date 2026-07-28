@@ -43,7 +43,10 @@ def test_login_runs_device_code_status_and_exchange(monkeypatch) -> None:
         return httpx.Response(200, json=next(responses))
 
     # 测试不渲染真实二维码矩阵，只验证 OAuth 请求顺序。
-    monkeypatch.setattr("qrcode.QRCode.print_ascii", lambda self, out=None: None)
+    monkeypatch.setattr(
+        "qrcode.QRCode.print_ascii",
+        lambda self, out=None, tty=False: None,
+    )
     client = OpenAuthClient(
         http_client=httpx.Client(transport=httpx.MockTransport(handler)),
         output=lambda _message: None,
@@ -81,7 +84,10 @@ def test_login_exports_qr_as_png(monkeypatch, tmp_path: Path) -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=next(responses))
 
-    monkeypatch.setattr("qrcode.QRCode.print_ascii", lambda self, out=None: None)
+    monkeypatch.setattr(
+        "qrcode.QRCode.print_ascii",
+        lambda self, out=None, tty=False: None,
+    )
     output_path = tmp_path / "nested" / "login.png"
     client = OpenAuthClient(
         http_client=httpx.Client(transport=httpx.MockTransport(handler)),
