@@ -145,12 +145,50 @@ uv run u115 upload /path/to/file.bin --cid 123456 --part-size 64
 uv run u115 upload file.bin --tokens /secure/path/115-tokens.json
 ```
 
+## 文件夹列表与检索
+
+列出 115 根目录的直接子文件夹：
+
+```bash
+uv run u115 folders
+```
+
+列出指定路径或 CID 下的直接子文件夹：
+
+```bash
+uv run u115 folders "/备份/照片"
+uv run u115 folders --cid 123456
+```
+
+递归列出指定路径下的全部后代文件夹：
+
+```bash
+uv run u115 folders "/备份" --recursive
+```
+
+按名称在整个 115 账号中搜索文件夹：
+
+```bash
+uv run u115 folders --search "旅行"
+```
+
+普通列表输出 `CID`、`PARENT_CID`、`PATH` 三列；搜索输出 `CID`、`PARENT_CID`、
+`NAME` 三列，列之间使用 Tab 分隔。CID 可以直接用于上传：
+
+```bash
+uv run u115 upload "/path/to/file.bin" --cid 123456
+```
+
+`--search` 已经检索整个账号，不能与路径、`--cid` 或 `--recursive` 同时使用。
+文件夹命令与登录、上传命令共用 OAuth 登录态，也支持 `--tokens` 指定其他登录态文件。
+
 查看完整参数：
 
 ```bash
 uv run u115 --help
 uv run u115 login --help
 uv run u115 upload --help
+uv run u115 folders --help
 ```
 
 ## 测试

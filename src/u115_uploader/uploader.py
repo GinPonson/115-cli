@@ -28,6 +28,21 @@ class UploadResult:
     response: dict[str, Any]
 
 
+@dataclass(frozen=True, slots=True)
+class RemoteFolder:
+    """115 文件夹列表中的标准化目录条目。
+
+    Attributes:
+        cid: 文件夹自身 CID。
+        parent_cid: 父文件夹 CID。
+        name: 文件夹名称。
+    """
+
+    cid: int
+    parent_cid: int
+    name: str
+
+
 def _hash_file(path: Path) -> tuple[str, str]:
     """单次顺序读取，同时计算整文件和前 128 KiB 的大写 SHA1。"""
     full = hashlib.sha1()
@@ -226,25 +241,110 @@ class OpenUploader:
 
     def _find_child_folders(self, parent_cid: int, name: str) -> list[int]:
         """分页列出父目录，并返回名称完全匹配的子目录 CID。"""
+        return [
+            folder.cid
+            for folder in self.list_child_folders(parent_cid)
+            if folder.name == name
+        ]
+
+    def list_child_folders(self, parent_cid: int = 0) -> list[RemoteFolder]:
+        """分页列出指定 115 目录的直接子文件夹。
+
+        Args:
+            parent_cid: 父目录 CID；根目录为 0，不能为负数。
+
+        Returns:
+            按文件名升序排列的直接子文件夹列表。
+
+        Raises:
+            ValueError: 父目录 CID 为负数。
+            UploadError: 网络、业务状态或响应字段不符合接口契约。
+        """
+        if parent_cid < 0:
+            raise ValueError("父目录 CID 不能为负数")
+        return self._list_folders(
+            f"{PRO_API}/open/ufile/files",
+            {
+                "aid": 1,
+                "cid": str(parent_cid),
+                "o": "file_name",
+                "asc": 1,
+                "show_dir": 1,
+                "fc_mix": 1,
+                "count_folders": 1,
+                # 对齐 StarVault：nf=1 让 115 只返回文件夹，避免无谓传输文件条目。
+                "nf": 1,
+            },
+            expected_parent_cid=parent_cid,
+        )
+
+    def search_folders(self, query: str) -> list[RemoteFolder]:
+        """按名称在整个 115 账号中搜索文件夹。
+
+        Args:
+            query: 非空的文件夹名称关键词，由 115 执行子串匹配。
+
+        Returns:
+            按文件名升序排列的匹配文件夹列表。
+
+        Raises:
+            ValueError: 搜索关键词为空。
+            UploadError: 网络、业务状态或响应字段不符合接口契约。
+        """
+        query = query.strip()
+        if not query:
+            raise ValueError("文件夹搜索关键词不能为空")
+        return self._list_folders(
+            f"{PRO_API}/open/ufile/search",
+            {
+                "search_value": query,
+                "aid": 1,
+                "cid": "0",
+                "o": "file_name",
+                "asc": 1,
+                "show_dir": 1,
+                "fc_mix": 1,
+                "count_folders": 1,
+                # 对齐 StarVault：fc=1 表示搜索结果只保留文件夹。
+                "fc": 1,
+            },
+            expected_parent_cid=None,
+        )
+
+    def _list_folders(
+        self,
+        url: str,
+        base_params: dict[str, Any],
+        *,
+        expected_parent_cid: int | None,
+    ) -> list[RemoteFolder]:
+        """分页请求文件列表端点并严格标准化其中的文件夹条目。
+
+        Args:
+            url: 115 文件列表或搜索端点。
+            base_params: 除 offset、limit 外的查询参数。
+            expected_parent_cid: 列目录时已知的父 CID；搜索时为 ``None``，改读响应字段。
+
+        Returns:
+            去重后的文件夹列表。
+
+        Raises:
+            UploadError: 请求失败或文件夹响应字段无效。
+        """
         offset = 0
         limit = 200
-        matches: list[int] = []
+        folders: list[RemoteFolder] = []
+        seen: set[int] = set()
         while True:
             try:
                 response = self.http.request(
                     "GET",
-                    f"{PRO_API}/open/ufile/files",
+                    url,
                     headers=self.headers,
                     params={
-                        "aid": 1,
-                        "cid": str(parent_cid),
-                        "o": "file_name",
-                        "asc": 1,
+                        **base_params,
                         "offset": offset,
                         "limit": limit,
-                        "show_dir": 1,
-                        "fc_mix": 1,
-                        "count_folders": 1,
                     },
                 )
                 response.raise_for_status()
@@ -259,27 +359,78 @@ class OpenUploader:
                 raise UploadError("115 目录列表响应格式无效")
             for item in items:
                 if not isinstance(item, dict):
-                    continue
-                # 115 当前存在两种列表字段：
-                # - 新版：fn=名称、fid=自身 ID、pid=父 ID、fc=0 表示目录；
-                # - 旧版：n=名称，目录没有 fid，自身 ID 位于 cid。
-                compact_schema = "fn" in item
-                item_name = str(item.get("fn") if compact_schema else item.get("n") or "")
-                is_folder = (
-                    str(item.get("fc")) == "0"
-                    if compact_schema
-                    else "fid" not in item
+                    raise UploadError("115 目录条目响应格式无效")
+                folder = self._parse_folder_item(
+                    item,
+                    expected_parent_cid=expected_parent_cid,
                 )
-                if is_folder and item_name == name:
-                    try:
-                        folder_id = item["fid"] if compact_schema else item["cid"]
-                        matches.append(int(folder_id))
-                    except (KeyError, TypeError, ValueError) as error:
-                        raise UploadError("115 返回了无效的目录 CID") from error
+                # 接口偶尔无视 nf/fc 并混入文件，明确过滤但不掩盖文件夹字段错误。
+                if folder is not None and folder.cid not in seen:
+                    seen.add(folder.cid)
+                    folders.append(folder)
             offset += len(items)
-            count = int(payload.get("count") or 0)
+            try:
+                count = int(payload.get("count") or 0)
+            except (TypeError, ValueError) as error:
+                raise UploadError("115 返回了无效的目录总数") from error
             if not items or offset >= count:
-                return matches
+                return folders
+
+    @staticmethod
+    def _parse_folder_item(
+        item: dict[str, Any],
+        *,
+        expected_parent_cid: int | None,
+    ) -> RemoteFolder | None:
+        """兼容两种 115 列表字段并把文件夹转换为统一模型。
+
+        Args:
+            item: 115 返回的单个文件或文件夹对象。
+            expected_parent_cid: 调用方已知的父 CID；全局搜索时为 ``None``。
+
+        Returns:
+            文件夹对应的 ``RemoteFolder``；普通文件返回 ``None``。
+
+        Raises:
+            UploadError: 文件夹缺少名称、CID 或父 CID 字段。
+        """
+        search_schema = "file_name" in item
+        compact_schema = "fn" in item
+        if search_schema:
+            # 搜索端点使用 file_category=0 表示文件夹；请求已带 fc=1，但仍严格判别。
+            is_folder = str(item.get("file_category", "0")) == "0"
+        elif compact_schema:
+            is_folder = str(item.get("fc")) == "0"
+        else:
+            is_folder = "fid" not in item
+        if not is_folder:
+            return None
+        try:
+            raw_name = (
+                item.get("file_name")
+                if search_schema
+                else item.get("fn") if compact_schema else item.get("n")
+            )
+            name = str(raw_name or "")
+            folder_id = (
+                item["file_id"]
+                if search_schema
+                else item["fid"] if compact_schema else item["cid"]
+            )
+            raw_parent = (
+                expected_parent_cid
+                if expected_parent_cid is not None
+                else item.get("parent_id", item.get("pid"))
+            )
+            if not name or raw_parent is None:
+                raise KeyError("name or parent cid")
+            return RemoteFolder(
+                cid=int(folder_id),
+                parent_cid=int(raw_parent),
+                name=name,
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise UploadError("115 返回了无效的文件夹字段") from error
 
     def _init(self, payload: dict[str, str]) -> dict[str, Any]:
         """调用上传初始化，错误响应不泄露 JSON 或敏感字段。"""

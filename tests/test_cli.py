@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from u115_uploader import cli
+from u115_uploader.uploader import RemoteFolder
 
 
 def test_load_tokens_uses_local_auth_flow(
@@ -82,3 +83,46 @@ def test_expand_upload_sources_rejects_empty_directory(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="没有可上传的文件"):
         cli.expand_upload_sources([empty])
+
+
+def test_collect_remote_folders_recursively_builds_paths() -> None:
+    """递归目录列表应保留完整路径，并按父子关系深度优先输出。"""
+    class FakeUploader:
+        """按父 CID 返回固定目录树的客户端替身。"""
+
+        def list_child_folders(self, parent_cid: int) -> list[RemoteFolder]:
+            """返回测试目录树中指定父目录的直接子节点。"""
+            return {
+                0: [
+                    RemoteFolder(cid=10, parent_cid=0, name="相册"),
+                    RemoteFolder(cid=20, parent_cid=0, name="视频"),
+                ],
+                10: [RemoteFolder(cid=11, parent_cid=10, name="旅行")],
+                11: [],
+                20: [],
+            }[parent_cid]
+
+    rows = cli.collect_remote_folders(
+        FakeUploader(),
+        parent_cid=0,
+        parent_path="/",
+        recursive=True,
+    )
+
+    assert [(folder.cid, path) for folder, path in rows] == [
+        (10, "/相册"),
+        (11, "/相册/旅行"),
+        (20, "/视频"),
+    ]
+
+
+def test_folders_parser_supports_path_recursive_and_search() -> None:
+    """folders 子命令应暴露路径遍历、递归和全局搜索参数。"""
+    parser = cli.build_parser()
+
+    recursive = parser.parse_args(["folders", "/相册", "--recursive"])
+    search = parser.parse_args(["folders", "--search", "旅行"])
+
+    assert recursive.path == "/相册"
+    assert recursive.recursive is True
+    assert search.search == "旅行"

@@ -157,3 +157,81 @@ def test_resolve_remote_directory_path_level_by_level() -> None:
     assert uploader.resolve_remote_dir("/备份/照片") == 20
     assert requests[0].url.params["cid"] == "0"
     assert requests[1].url.params["cid"] == "10"
+
+
+def test_list_child_folders_uses_folder_only_filter_and_paginates() -> None:
+    """目录列表应使用 nf=1，兼容两种字段形状并按 count 完整翻页。"""
+    requests = []
+    responses = iter(
+        [
+            {
+                "state": True,
+                "count": 3,
+                "data": [
+                    {"cid": "10", "n": "相册"},
+                    {"fid": "file-1", "cid": "0", "n": "普通文件.txt"},
+                ],
+            },
+            {
+                "state": True,
+                "count": 3,
+                "data": [
+                    {"fid": "20", "pid": "0", "fn": "视频", "fc": "0"},
+                ],
+            },
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=next(responses))
+
+    uploader = OpenUploader(
+        "token",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    folders = uploader.list_child_folders(0)
+
+    assert [(folder.cid, folder.parent_cid, folder.name) for folder in folders] == [
+        (10, 0, "相册"),
+        (20, 0, "视频"),
+    ]
+    assert requests[0].url.params["nf"] == "1"
+    assert requests[1].url.params["offset"] == "2"
+
+
+def test_search_folders_uses_global_folder_search_shape() -> None:
+    """全局文件夹搜索应传 fc=1，并解析 search 端点的完整字段名。"""
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(dict(request.url.params))
+        return httpx.Response(
+            200,
+            json={
+                "state": True,
+                "count": 1,
+                "data": [
+                    {
+                        "file_id": "88",
+                        "parent_id": "9",
+                        "file_name": "旅行照片",
+                        "file_category": "0",
+                    }
+                ],
+            },
+        )
+
+    uploader = OpenUploader(
+        "token",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    folders = uploader.search_folders("旅行")
+
+    assert [(folder.cid, folder.parent_cid, folder.name) for folder in folders] == [
+        (88, 9, "旅行照片"),
+    ]
+    assert captured["search_value"] == "旅行"
+    assert captured["fc"] == "1"
