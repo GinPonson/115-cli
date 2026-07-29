@@ -5,16 +5,33 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic
 from typing import Any, Callable
 
 import httpx
-import oss2
 
 PRO_API = "https://proapi.115.com"
 PREFIX_SIZE = 128 * 1024
+
+
+def _load_oss2() -> Any:
+    """延迟加载 OSS SDK，并隔离其 Python 3.12 文档字符串语法警告。
+
+    Returns:
+        已加载的 ``oss2`` 模块。
+
+    Notes:
+        仅忽略第三方模块导入阶段的 ``SyntaxWarning``；上传时的网络、协议和业务异常
+        不在此处捕获，仍会完整向上暴露。
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", SyntaxWarning)
+        import oss2
+
+    return oss2
 
 
 class UploadError(RuntimeError):
@@ -178,8 +195,10 @@ class OpenUploader:
         """
         if not access_token:
             raise ValueError("access token 不能为空")
+        oss2 = _load_oss2()
         self.http = http_client or httpx.Client(timeout=60)
         self.headers = {"Authorization": f"Bearer {access_token}"}
+        self.oss2 = oss2
         self.bucket_factory = bucket_factory or oss2.Bucket
 
     def upload(
@@ -369,11 +388,17 @@ class OpenUploader:
             if folder.name == name
         ]
 
-    def list_child_folders(self, parent_cid: int = 0) -> list[RemoteFolder]:
+    def list_child_folders(
+        self,
+        parent_cid: int = 0,
+        *,
+        max_results: int | None = None,
+    ) -> list[RemoteFolder]:
         """分页列出指定 115 目录的直接子文件夹。
 
         Args:
             parent_cid: 父目录 CID；根目录为 0，不能为负数。
+            max_results: 最多读取的目录数；``None`` 表示读取全部。
 
         Returns:
             按文件名升序排列的直接子文件夹列表。
@@ -384,6 +409,8 @@ class OpenUploader:
         """
         if parent_cid < 0:
             raise ValueError("父目录 CID 不能为负数")
+        if max_results is not None and max_results <= 0:
+            return []
         return self._list_folders(
             f"{PRO_API}/open/ufile/files",
             {
@@ -398,13 +425,20 @@ class OpenUploader:
                 "nf": 1,
             },
             expected_parent_cid=parent_cid,
+            max_results=max_results,
         )
 
-    def search_folders(self, query: str) -> list[RemoteFolder]:
+    def search_folders(
+        self,
+        query: str,
+        *,
+        max_results: int | None = None,
+    ) -> list[RemoteFolder]:
         """按名称在整个 115 账号中搜索文件夹。
 
         Args:
             query: 非空的文件夹名称关键词，由 115 执行子串匹配。
+            max_results: 最多读取的目录数；``None`` 表示读取全部。
 
         Returns:
             按文件名升序排列的匹配文件夹列表。
@@ -431,6 +465,7 @@ class OpenUploader:
                 "fc": 1,
             },
             expected_parent_cid=None,
+            max_results=max_results,
         )
 
     def list_files_page(
@@ -683,6 +718,7 @@ class OpenUploader:
         base_params: dict[str, Any],
         *,
         expected_parent_cid: int | None,
+        max_results: int | None = None,
     ) -> list[RemoteFolder]:
         """分页请求文件列表端点并严格标准化其中的文件夹条目。
 
@@ -690,6 +726,7 @@ class OpenUploader:
             url: 115 文件列表或搜索端点。
             base_params: 除 offset、limit 外的查询参数。
             expected_parent_cid: 列目录时已知的父 CID；搜索时为 ``None``，改读响应字段。
+            max_results: 最多读取的目录数；``None`` 表示读取全部。
 
         Returns:
             去重后的文件夹列表。
@@ -698,7 +735,7 @@ class OpenUploader:
             UploadError: 请求失败或文件夹响应字段无效。
         """
         offset = 0
-        limit = 200
+        limit = 200 if max_results is None else min(200, max_results)
         folders: list[RemoteFolder] = []
         seen: set[int] = set()
         while True:
@@ -734,6 +771,8 @@ class OpenUploader:
                 if folder is not None and folder.cid not in seen:
                     seen.add(folder.cid)
                     folders.append(folder)
+                    if max_results is not None and len(folders) >= max_results:
+                        return folders
             offset += len(items)
             try:
                 count = int(payload.get("count") or 0)
@@ -844,7 +883,7 @@ class OpenUploader:
         progress_output: Callable[[str], None],
     ) -> None:
         """使用 STS 执行单 PUT 或流式 multipart 上传。"""
-        auth = oss2.StsAuth(
+        auth = self.oss2.StsAuth(
             str(sts["AccessKeyId"]),
             str(sts["AccessKeySecret"]),
             str(sts["SecurityToken"]),
@@ -872,7 +911,7 @@ class OpenUploader:
                 # callback 仍会因完整文件 SHA1 无效而拒绝入库。
                 params={"sequential": ""},
             ).upload_id
-            parts: list[oss2.models.PartInfo] = []
+            parts: list[Any] = []
             with source.open("rb") as stream:
                 part_number = 1
                 while chunk := stream.read(part_size):
@@ -883,7 +922,7 @@ class OpenUploader:
                         chunk,
                     )
                     parts.append(
-                        oss2.models.PartInfo(
+                        self.oss2.models.PartInfo(
                             part_number,
                             result.etag,
                             size=len(chunk),
