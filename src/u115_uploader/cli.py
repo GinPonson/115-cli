@@ -119,17 +119,22 @@ def _files_in_directory(directory: Path) -> list[Path]:
     return files
 
 
-def expand_upload_sources(sources: Sequence[Path]) -> list[Path]:
+def expand_upload_sources(
+    sources: Sequence[Path],
+    *,
+    unmatched_globs: list[Path] | None = None,
+) -> list[Path]:
     """把文件、目录和通配符统一展开为去重后的普通文件列表。
 
     Args:
         sources: CLI 接收的本地路径或通配符表达式；已存在路径优先按字面处理。
+        unmatched_globs: 可选输出列表；未匹配的通配符会追加到该列表并跳过。
 
     Returns:
         保持参数顺序、目录内稳定排序且去重后的绝对文件路径列表。
 
     Raises:
-        FileNotFoundError: 普通路径不存在，或通配符没有匹配任何路径。
+        FileNotFoundError: 不含通配符的普通路径不存在。
         ValueError: 输入不是普通文件/目录，或目录中没有普通文件。
         OSError: 读取路径或遍历目录失败。
     """
@@ -154,7 +159,9 @@ def expand_upload_sources(sources: Sequence[Path]) -> list[Path]:
                 )
             ]
             if not matches:
-                raise FileNotFoundError(f"通配符未匹配任何路径：{source}")
+                if unmatched_globs is not None:
+                    unmatched_globs.append(source)
+                continue
 
         for match in matches:
             resolved = match.resolve()
@@ -639,7 +646,16 @@ def run(argv: Sequence[str] | None = None) -> int:
             return 0
 
         if args.command == "verify":
-            sources = expand_upload_sources(args.files)
+            unmatched_globs: list[Path] = []
+            sources = expand_upload_sources(
+                args.files,
+                unmatched_globs=unmatched_globs,
+            )
+            for pattern in unmatched_globs:
+                print(f"已跳过未匹配通配符：{pattern}", file=sys.stderr)
+            if not sources:
+                print("没有匹配到可校验的文件，未执行任何操作。", file=sys.stderr)
+                return 3
             tokens = load_tokens(token_path)
             uploader = OpenUploader(tokens.access_token)
             parent_cid = (
@@ -667,7 +683,16 @@ def run(argv: Sequence[str] | None = None) -> int:
 
         # 登录态不存在时主动生成二维码；登录成功后 OAuth tokens 会写回文件。
         # 已有 access token 临近过期时，认证模块会先刷新并原子保存新令牌。
-        sources = expand_upload_sources(args.files)
+        unmatched_globs = []
+        sources = expand_upload_sources(
+            args.files,
+            unmatched_globs=unmatched_globs,
+        )
+        for pattern in unmatched_globs:
+            print(f"已跳过未匹配通配符：{pattern}", file=sys.stderr)
+        if not sources:
+            print("没有匹配到可上传的文件，未执行任何操作。", file=sys.stderr)
+            return 3
         if args.on_conflict == "skip" and (
             args.delete_source_after_verify
             or args.move_source_after_verify is not None

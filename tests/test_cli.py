@@ -68,12 +68,22 @@ def test_expand_upload_sources_treats_existing_special_name_as_literal(
     assert cli.expand_upload_sources([special]) == [special.resolve()]
 
 
-def test_expand_upload_sources_rejects_unmatched_glob(tmp_path: Path) -> None:
-    """通配符无匹配项时必须明确报错，不能静默跳过输入。"""
+def test_expand_upload_sources_records_and_skips_unmatched_glob(
+    tmp_path: Path,
+) -> None:
+    """通配符无匹配项时应记录并跳过，不影响其他已匹配输入。"""
     pattern = Path(f"{tmp_path}/**/*.missing")
+    existing = tmp_path / "existing.dat"
+    existing.write_bytes(b"data")
+    unmatched: list[Path] = []
 
-    with pytest.raises(FileNotFoundError, match="通配符未匹配任何路径"):
-        cli.expand_upload_sources([pattern])
+    result = cli.expand_upload_sources(
+        [pattern, existing],
+        unmatched_globs=unmatched,
+    )
+
+    assert result == [existing.resolve()]
+    assert unmatched == [pattern]
 
 
 def test_expand_upload_sources_rejects_empty_directory(tmp_path: Path) -> None:
@@ -284,3 +294,26 @@ def test_list_defaults_to_one_bounded_page(
     assert requested_limits == [100]
     assert captured.out.count("\n") == 101
     assert "最多输出 100 条" in captured.err
+
+
+def test_upload_returns_no_work_when_every_glob_is_unmatched(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    """全部通配符均未匹配时不应登录或报失败，并返回无工作退出码 3。"""
+    exit_code = cli.run(
+        [
+            "upload",
+            str(tmp_path / "*.missing"),
+            "--remote-dir",
+            "/remote-target",
+            "--tokens",
+            str(tmp_path / "tokens.json"),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 3
+    assert "已跳过未匹配通配符" in captured.err
+    assert "未执行任何操作" in captured.err
+    assert "操作失败" not in captured.err
