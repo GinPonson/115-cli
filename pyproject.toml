@@ -1,8 +1,9 @@
 [project]
 name = "u115-uploader"
 version = "0.1.0"
-description = "115 网盘开放平台二维码登录与文件上传 CLI"
+description = "115 cloud drive QR-code login and file upload CLI"
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.12"
 dependencies = [
     "httpx[socks]>=0.28",

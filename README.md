@@ -2,6 +2,8 @@
 
 一个轻量的 Python CLI，用 115 App 扫码登录后，把指定文件上传到 115 网盘。
 
+> English version: [README.en.md](./README.en.md)
+
 ## 功能
 
 - 115 开放平台设备码登录、终端二维码和 OAuth token 自动刷新
