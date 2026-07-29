@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Sequence
 
 from .auth import OpenAuthClient, TokenStore
-from .uploader import OpenUploader, RemoteFilePage, RemoteFolder
+from .uploader import OpenUploader, RemoteFolder
 from .workflow import (
     VerifiedUpload,
     append_manifest,
@@ -79,22 +79,22 @@ def nonnegative_integer(value: str) -> int:
     return number
 
 
-def file_page_limit(value: str) -> int:
-    """解析 115 文件列表的单页大小。
+def positive_integer(value: str) -> int:
+    """解析严格大于零的整数参数。
 
     Args:
         value: argparse 收到的字符串。
 
     Returns:
-        1 到 1150 之间的单页条数。
+        严格大于零的整数。
 
     Raises:
-        argparse.ArgumentTypeError: 输入不是允许范围内的整数。
+        argparse.ArgumentTypeError: 输入不是正整数。
     """
-    limit = nonnegative_integer(value)
-    if not 1 <= limit <= 1150:
-        raise argparse.ArgumentTypeError("必须在 1 到 1150 之间")
-    return limit
+    number = nonnegative_integer(value)
+    if number == 0:
+        raise argparse.ArgumentTypeError("必须大于 0")
+    return number
 
 
 def _files_in_directory(directory: Path) -> list[Path]:
@@ -180,6 +180,8 @@ def collect_remote_folders(
     parent_cid: int,
     parent_path: str,
     recursive: bool,
+    max_depth: int | None = None,
+    max_folders: int | None = None,
 ) -> list[tuple[RemoteFolder, str]]:
     """列出指定远端目录，并按需递归生成每个文件夹的完整路径。
 
@@ -188,6 +190,8 @@ def collect_remote_folders(
         parent_cid: 起始父目录 CID。
         parent_path: 起始父目录的绝对显示路径。
         recursive: 是否递归遍历全部后代目录。
+        max_depth: 相对起始目录的最大递归深度；``None`` 表示不限制。
+        max_folders: 最大目录扫描数；超过时明确失败，``None`` 表示不限制。
 
     Returns:
         ``(文件夹, 绝对路径)`` 元组列表，顺序与 115 的名称排序一致。
@@ -199,9 +203,27 @@ def collect_remote_folders(
     rows: list[tuple[RemoteFolder, str]] = []
     visited = {parent_cid}
 
-    def visit(current_cid: int, current_path: str) -> None:
+    def visit(current_cid: int, current_path: str, depth: int) -> None:
         """深度优先访问当前目录，并阻止异常 CID 环导致无限请求。"""
-        for folder in uploader.list_child_folders(current_cid):
+        remaining = (
+            None
+            if max_folders is None
+            else max(max_folders - len(rows), 0)
+        )
+        child_folders = (
+            uploader.list_child_folders(current_cid)
+            if max_folders is None
+            else uploader.list_child_folders(
+                current_cid,
+                max_results=remaining,
+            )
+        )
+        for folder in child_folders:
+            if max_folders is not None and len(rows) >= max_folders:
+                raise RuntimeError(
+                    f"目录扫描超过安全上限 {max_folders}；"
+                    "请提高 --max-directories 后重试"
+                )
             if folder.cid in visited:
                 raise RuntimeError(f"115 目录结构包含重复 CID：{folder.cid}")
             visited.add(folder.cid)
@@ -211,10 +233,10 @@ def collect_remote_folders(
                 else f"{current_path.rstrip('/')}/{folder.name}"
             )
             rows.append((folder, folder_path))
-            if recursive:
-                visit(folder.cid, folder_path)
+            if recursive and (max_depth is None or depth < max_depth):
+                visit(folder.cid, folder_path, depth + 1)
 
-    visit(parent_cid, parent_path)
+    visit(parent_cid, parent_path, 1)
     return rows
 
 
@@ -236,30 +258,6 @@ def _terminal_field(value: object) -> str:
     )
 
 
-def print_remote_file_page(page: RemoteFilePage, *, seen: set[int]) -> int:
-    """输出一页远端文件，并跨页过滤重复文件 ID。
-
-    Args:
-        page: 已标准化的 115 文件页。
-        seen: 当前命令已经输出的文件 ID 集合。
-
-    Returns:
-        本页实际输出的文件数量。
-    """
-    printed = 0
-    for remote_file in page.files:
-        if remote_file.file_id in seen:
-            continue
-        seen.add(remote_file.file_id)
-        print(
-            f"{remote_file.file_id}\t{remote_file.parent_cid}\t"
-            f"{remote_file.size}\t{_terminal_field(remote_file.sha1)}\t"
-            f"{_terminal_field(remote_file.name)}"
-        )
-        printed += 1
-    return printed
-
-
 def _add_destination_arguments(parser: argparse.ArgumentParser) -> None:
     """为需要目标目录的命令添加互斥路径/CID 参数。
 
@@ -276,10 +274,10 @@ def _add_destination_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_upload_options(parser: argparse.ArgumentParser) -> None:
-    """为 upload 与 sync 添加共享的安全上传选项。
+    """为 upload 添加强校验、冲突与本地清理选项。
 
     Args:
-        parser: upload 或 sync 子命令解析器。
+        parser: upload 子命令解析器。
     """
     parser.add_argument(
         "files",
@@ -299,7 +297,7 @@ def _add_upload_options(parser: argparse.ArgumentParser) -> None:
         "--on-conflict",
         choices=("error", "skip", "verify", "rename"),
         default="error",
-        help="远端同名文件策略；upload 默认 error，sync 默认 verify",
+        help="远端同名文件策略，默认 verify",
     )
     parser.add_argument(
         "--retry",
@@ -348,105 +346,74 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PNG",
         help="将认证二维码同时导出为 PNG 图片",
     )
-    upload_parser = subparsers.add_parser("upload", help="上传并强校验本地文件")
+    upload_parser = subparsers.add_parser("upload", help="上传或校验并跳过已存在文件")
     _add_upload_options(upload_parser)
-    sync_parser = subparsers.add_parser("sync", help="上传缺失文件并校验已存在文件")
-    _add_upload_options(sync_parser)
-    sync_parser.set_defaults(on_conflict="verify")
+    upload_parser.set_defaults(on_conflict="verify")
     verify_parser = subparsers.add_parser("verify", help="强校验本地文件是否已存在于 115")
     verify_parser.add_argument("files", nargs="+", type=Path, help="要校验的本地文件或通配符")
     _add_destination_arguments(verify_parser)
     verify_parser.add_argument("--manifest", type=Path, metavar="JSONL", help="追加校验结果")
-    duplicates_parser = subparsers.add_parser(
-        "duplicates",
-        help="按 SHA1 列出指定 115 目录中的重复文件",
+    list_parser = subparsers.add_parser(
+        "list",
+        help="统一列出、搜索或检查重复的 115 文件与文件夹",
     )
-    duplicates_parser.add_argument("path", nargs="?", default="/", help="115 目录路径")
-    duplicates_parser.add_argument("--cid", type=nonnegative_integer, help="115 目录 CID")
-    trash_parser = subparsers.add_parser("trash", help="按精确文件 ID 移入 115 回收站")
-    trash_parser.add_argument("file_ids", nargs="+", type=nonnegative_integer, help="文件 ID")
-    trash_parser.add_argument(
+    list_parser.add_argument("path", nargs="?", default="/", help="115 目录路径")
+    list_parser.add_argument("--cid", type=nonnegative_integer, help="115 目录 CID")
+    list_parser.add_argument(
+        "--type",
+        choices=("all", "file", "folder"),
+        default="all",
+        help="条目类型，默认 all",
+    )
+    list_parser.add_argument("--recursive", action="store_true", help="递归列出全部后代")
+    list_parser.add_argument("--search", metavar="KEYWORD", help="在整个账号中按名称搜索")
+    list_parser.add_argument(
+        "--limit",
+        type=positive_integer,
+        default=100,
+        help="最多输出的条目数，默认 100",
+    )
+    list_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="显式允许读取并输出当前范围内的全部条目",
+    )
+    list_parser.add_argument(
+        "--max-depth",
+        type=positive_integer,
+        default=20,
+        help="递归目录最大深度，默认 20",
+    )
+    list_parser.add_argument(
+        "--max-directories",
+        type=positive_integer,
+        default=1000,
+        help="最多扫描的目录数，默认 1000",
+    )
+    list_parser.add_argument(
+        "--duplicates",
+        action="store_true",
+        help="只输出当前范围内 SHA1 重复的文件",
+    )
+    delete_parser = subparsers.add_parser("delete", help="按精确文件 ID 移入 115 回收站")
+    delete_parser.add_argument("file_ids", nargs="+", type=nonnegative_integer, help="文件 ID")
+    delete_parser.add_argument(
         "--parent-cid",
         required=True,
         type=nonnegative_integer,
         help="这些文件当前所在的父目录 CID",
     )
-    trash_parser.add_argument(
+    delete_parser.add_argument(
         "--yes",
         action="store_true",
         help="确认执行回收站操作；缺少时拒绝执行",
     )
-    folders_parser = subparsers.add_parser(
-        "folders",
-        help="列出或搜索 115 文件夹",
-    )
-    folders_parser.add_argument(
-        "path",
-        nargs="?",
-        default="/",
-        help="要列出的 115 绝对目录路径，默认根目录",
-    )
-    folders_parser.add_argument(
-        "--cid",
-        type=int,
-        help="直接指定要列出的父目录 CID",
-    )
-    folders_parser.add_argument(
-        "--recursive",
-        action="store_true",
-        help="递归列出全部后代文件夹",
-    )
-    folders_parser.add_argument(
-        "--search",
-        metavar="KEYWORD",
-        help="按名称在整个 115 账号中搜索文件夹",
-    )
-    files_parser = subparsers.add_parser(
-        "files",
-        help="分页列出或搜索 115 文件",
-    )
-    files_parser.add_argument(
-        "path",
-        nargs="?",
-        default="/",
-        help="要列出的 115 绝对目录路径，默认根目录",
-    )
-    files_parser.add_argument(
-        "--cid",
-        type=nonnegative_integer,
-        help="直接指定要列出文件的父目录 CID",
-    )
-    files_parser.add_argument(
-        "--offset",
-        type=nonnegative_integer,
-        default=0,
-        help="分页偏移，默认 0",
-    )
-    files_parser.add_argument(
-        "--limit",
-        type=file_page_limit,
-        default=100,
-        help="单页条数，范围 1-1150，默认 100",
-    )
-    files_parser.add_argument(
-        "--all",
-        action="store_true",
-        help="从 offset 开始自动读取全部剩余页",
-    )
-    files_parser.add_argument(
-        "--search",
-        metavar="KEYWORD",
-        help="按名称在整个 115 账号中搜索文件",
-    )
     for command_parser in (
         login_parser,
         upload_parser,
-        sync_parser,
         verify_parser,
-        duplicates_parser,
-        trash_parser,
-        folders_parser,
-        files_parser,
+        list_parser,
+        delete_parser,
     ):
         command_parser.add_argument(
             "--tokens",
@@ -472,7 +439,7 @@ def run(argv: Sequence[str] | None = None) -> int:
     # 最后一个参数必须是不存在的绝对本地路径，才会被解释为 115 路径，避免误判本地文件。
     if (
         raw_argv
-        and raw_argv[0] in {"upload", "sync"}
+        and raw_argv[0] == "upload"
         and "--remote-dir" not in raw_argv
         and "--cid" not in raw_argv
         and len(raw_argv) >= 3
@@ -498,26 +465,81 @@ def run(argv: Sequence[str] | None = None) -> int:
             print(f"登录态已保存：{token_path}")
             return 0
 
-        if args.command == "folders":
+        if args.command == "list":
             if args.cid is not None and args.path != "/":
-                raise ValueError("文件夹路径与 --cid 不能同时指定")
-            if args.cid is not None and args.cid < 0:
-                raise ValueError("父目录 CID 不能为负数")
+                raise ValueError("目录路径与 --cid 不能同时指定")
             if args.search is not None and (args.cid is not None or args.path != "/"):
-                raise ValueError("--search 不能与文件夹路径或 --cid 同时使用")
+                raise ValueError("--search 不能与目录路径或 --cid 同时使用")
             if args.search is not None and args.recursive:
                 raise ValueError("--search 已检索整个账号，不能再指定 --recursive")
-
+            if args.duplicates and args.type == "folder":
+                raise ValueError("--duplicates 只适用于文件")
+            if args.duplicates and not args.all:
+                raise ValueError("--duplicates 需要完整扫描，必须显式指定 --all")
             tokens = load_tokens(token_path)
             uploader = OpenUploader(tokens.access_token)
-            if args.search is not None:
-                folders = uploader.search_folders(args.search)
-                print("CID\tPARENT_CID\tNAME")
-                for folder in folders:
-                    print(
-                        f"{folder.cid}\t{folder.parent_cid}\t"
-                        f"{_terminal_field(folder.name)}"
+
+            folders: list[tuple[RemoteFolder, str]] = []
+            remote_files = []
+            output_limit: int | None = None if args.all else args.limit
+
+            def remaining_capacity() -> int | None:
+                """返回普通列表还能接收的文件数；全量或重复模式不设上限。"""
+                if output_limit is None or args.duplicates:
+                    return None
+                return max(output_limit - len(folders) - len(remote_files), 0)
+
+            def append_file_pages(parent_cid: int | None = None) -> bool:
+                """分页追加文件，达到输出预算时立即停止继续请求。
+
+                Args:
+                    parent_cid: 普通目录 CID；为 ``None`` 时执行全局搜索。
+
+                Returns:
+                    当前输出预算是否已经耗尽。
+                """
+                offset = 0
+                while True:
+                    remaining = remaining_capacity()
+                    if remaining == 0:
+                        return True
+                    page_limit = 1150 if remaining is None else min(remaining, 1150)
+                    page = (
+                        uploader.search_files_page(
+                            args.search,
+                            offset=offset,
+                            limit=page_limit,
+                        )
+                        if parent_cid is None
+                        else uploader.list_files_page(
+                            parent_cid,
+                            offset=offset,
+                            limit=page_limit,
+                        )
                     )
+                    remote_files.extend(page.files)
+                    if page.next_offset is None:
+                        return False
+                    if page.next_offset <= offset:
+                        raise RuntimeError("115 文件列表分页偏移未前进")
+                    offset = page.next_offset
+
+            if args.search is not None:
+                if args.type in {"all", "folder"} and not args.duplicates:
+                    folder_limit = (
+                        args.max_directories
+                        if output_limit is None
+                        else remaining_capacity()
+                    )
+                    folders = [
+                        (folder, folder.name)
+                        for folder in uploader.search_folders(
+                            args.search,
+                            max_results=folder_limit,
+                        )
+                    ]
+                if args.type in {"all", "file"}:
+                    append_file_pages()
             else:
                 parent_cid = (
                     args.cid
@@ -525,100 +547,86 @@ def run(argv: Sequence[str] | None = None) -> int:
                     else uploader.resolve_remote_dir(args.path)
                 )
                 parent_path = args.path if args.cid is None else f"cid:{parent_cid}"
-                rows = collect_remote_folders(
-                    uploader,
-                    parent_cid=parent_cid,
-                    parent_path=parent_path,
-                    recursive=args.recursive,
-                )
-                print("CID\tPARENT_CID\tPATH")
-                for folder, folder_path in rows:
+                if args.type in {"all", "folder"} and not args.duplicates:
+                    folders = collect_remote_folders(
+                        uploader,
+                        parent_cid=parent_cid,
+                        parent_path=parent_path,
+                        recursive=args.recursive,
+                        max_depth=args.max_depth,
+                        max_folders=(
+                            args.max_directories
+                            if output_limit is None
+                            else min(args.max_directories, output_limit)
+                        ),
+                    )
+                    if output_limit is not None:
+                        folders = folders[:output_limit]
+                file_cids = [parent_cid]
+                if args.recursive and args.type in {"all", "file"}:
+                    # 文件递归需要完整目录树；当 --type=file 时前面没有收集目录。
+                    file_folders = (
+                        folders
+                        if folders
+                        else collect_remote_folders(
+                            uploader,
+                            parent_cid=parent_cid,
+                            parent_path=parent_path,
+                            recursive=True,
+                            max_depth=args.max_depth,
+                            max_folders=args.max_directories,
+                        )
+                    )
+                    file_cids.extend(folder.cid for folder, _path in file_folders)
+                if args.type in {"all", "file"}:
+                    for file_cid in file_cids:
+                        if append_file_pages(file_cid):
+                            break
+
+            if args.duplicates:
+                groups: dict[str, list] = {}
+                for remote_file in remote_files:
+                    if remote_file.sha1:
+                        groups.setdefault(remote_file.sha1, []).append(remote_file)
+                remote_files = [
+                    remote_file
+                    for group in groups.values()
+                    if len(group) > 1
+                    for remote_file in group
+                ]
+
+            print("TYPE\tID\tPARENT_ID\tSIZE\tSHA1\tNAME")
+            for folder, display_path in folders:
+                if not args.duplicates:
                     print(
-                        f"{folder.cid}\t{folder.parent_cid}\t"
-                        f"{_terminal_field(folder_path)}"
+                        f"folder\t{folder.cid}\t{folder.parent_cid}\t\t\t"
+                        f"{_terminal_field(display_path)}"
                     )
-            return 0
-
-        if args.command == "files":
-            if args.cid is not None and args.path != "/":
-                raise ValueError("文件路径与 --cid 不能同时指定")
-            if args.search is not None and (args.cid is not None or args.path != "/"):
-                raise ValueError("--search 不能与目录路径或 --cid 同时使用")
-
-            tokens = load_tokens(token_path)
-            uploader = OpenUploader(tokens.access_token)
-            parent_cid = (
-                args.cid
-                if args.cid is not None
-                else uploader.resolve_remote_dir(args.path)
-            )
-            current_offset = args.offset
-            seen: set[int] = set()
-            shown = 0
-            total = 0
-            next_offset: int | None = current_offset
-            print("FILE_ID\tPARENT_CID\tSIZE\tSHA1\tNAME")
-
-            while next_offset is not None:
-                page = (
-                    uploader.search_files_page(
-                        args.search,
-                        offset=current_offset,
-                        limit=args.limit,
-                    )
-                    if args.search is not None
-                    else uploader.list_files_page(
-                        parent_cid,
-                        offset=current_offset,
-                        limit=args.limit,
-                    )
+            for remote_file in remote_files:
+                print(
+                    f"file\t{remote_file.file_id}\t{remote_file.parent_cid}\t"
+                    f"{remote_file.size}\t{remote_file.sha1}\t"
+                    f"{_terminal_field(remote_file.name)}"
                 )
-                shown += print_remote_file_page(page, seen=seen)
-                total = page.total
-                next_offset = page.next_offset
-                if not args.all or next_offset is None:
-                    break
-                if next_offset <= current_offset:
-                    raise RuntimeError("115 文件列表分页偏移未前进")
-                current_offset = next_offset
-
-            summary = f"已显示 {shown} 个文件；匹配总数 {total}"
-            if next_offset is not None:
-                summary += (
-                    f"；下一页：--offset {next_offset} --limit {args.limit}"
+            if args.duplicates:
+                duplicate_sha1s = {
+                    remote_file.sha1 for remote_file in remote_files
+                }
+                print(f"发现 {len(duplicate_sha1s)} 组重复文件", file=sys.stderr)
+            else:
+                limit_message = (
+                    ""
+                    if args.all
+                    else f"；最多输出 {args.limit} 条，使用 --all 读取全部"
                 )
-            print(summary, file=sys.stderr)
+                print(
+                    f"已显示 {len(folders)} 个文件夹、{len(remote_files)} 个文件"
+                    f"{limit_message}",
+                    file=sys.stderr,
+                )
             return 0
 
-        if args.command == "duplicates":
-            if args.cid is not None and args.path != "/":
-                raise ValueError("目录路径与 --cid 不能同时指定")
-            tokens = load_tokens(token_path)
-            uploader = OpenUploader(tokens.access_token)
-            parent_cid = (
-                args.cid
-                if args.cid is not None
-                else uploader.resolve_remote_dir(args.path)
-            )
-            groups: dict[str, list] = {}
-            for remote_file in uploader.list_all_files(parent_cid):
-                if remote_file.sha1:
-                    groups.setdefault(remote_file.sha1, []).append(remote_file)
-            duplicate_groups = [
-                group for group in groups.values() if len(group) > 1
-            ]
-            print("SHA1\tFILE_ID\tPARENT_CID\tSIZE\tNAME")
-            for group in sorted(duplicate_groups, key=lambda items: items[0].sha1):
-                for remote_file in group:
-                    print(
-                        f"{remote_file.sha1}\t{remote_file.file_id}\t"
-                        f"{remote_file.parent_cid}\t{remote_file.size}\t"
-                        f"{_terminal_field(remote_file.name)}"
-                    )
-            print(f"发现 {len(duplicate_groups)} 组重复文件", file=sys.stderr)
-            return 0
-
-        if args.command == "trash":
+        if args.command == "delete":
             if not args.yes:
                 raise ValueError("回收站操作必须显式指定 --yes")
             if any(file_id <= 0 for file_id in args.file_ids):

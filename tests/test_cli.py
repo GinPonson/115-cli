@@ -116,35 +116,23 @@ def test_collect_remote_folders_recursively_builds_paths() -> None:
     ]
 
 
-def test_folders_parser_supports_path_recursive_and_search() -> None:
-    """folders 子命令应暴露路径遍历、递归和全局搜索参数。"""
+def test_list_parser_supports_types_recursive_search_and_duplicates() -> None:
+    """list 子命令应统一提供类型、递归、搜索和重复文件参数。"""
     parser = cli.build_parser()
 
-    recursive = parser.parse_args(["folders", "/相册", "--recursive"])
-    search = parser.parse_args(["folders", "--search", "旅行"])
+    recursive = parser.parse_args(
+        ["list", "/相册", "--type", "file", "--recursive"]
+    )
+    search = parser.parse_args(
+        ["list", "--search", "旅行", "--type", "all"]
+    )
+    duplicates = parser.parse_args(["list", "/视频", "--duplicates"])
 
     assert recursive.path == "/相册"
     assert recursive.recursive is True
+    assert recursive.type == "file"
     assert search.search == "旅行"
-
-
-def test_files_parser_defaults_to_bounded_page_and_supports_search() -> None:
-    """files 默认只读取 100 条，并允许显式指定分页或全量检索。"""
-    parser = cli.build_parser()
-
-    default_page = parser.parse_args(["files", "/视频"])
-    search_all = parser.parse_args(
-        ["files", "--search", "校验", "--offset", "100", "--limit", "200", "--all"]
-    )
-
-    assert default_page.path == "/视频"
-    assert default_page.offset == 0
-    assert default_page.limit == 100
-    assert default_page.all is False
-    assert search_all.search == "校验"
-    assert search_all.offset == 100
-    assert search_all.limit == 200
-    assert search_all.all is True
+    assert duplicates.duplicates is True
 
 
 def test_extended_command_parsers_expose_safe_workflow_options() -> None:
@@ -164,39 +152,135 @@ def test_extended_command_parsers_expose_safe_workflow_options() -> None:
             "2",
         ]
     )
-    sync = parser.parse_args(["sync", "folder", "--remote-dir", "/备份"])
-    trash = parser.parse_args(["trash", "123", "--parent-cid", "9", "--yes"])
+    default_upload = parser.parse_args(["upload", "folder", "--remote-dir", "/备份"])
+    delete = parser.parse_args(["delete", "123", "--parent-cid", "9", "--yes"])
 
     assert upload.on_conflict == "rename"
     assert upload.delete_source_after_verify is True
     assert upload.retry == 2
-    assert sync.on_conflict == "verify"
-    assert trash.yes is True
+    assert default_upload.on_conflict == "verify"
+    assert delete.yes is True
 
 
-def test_print_remote_file_page_escapes_names_and_deduplicates(
+def test_list_recursively_reports_only_duplicate_files(
+    monkeypatch,
+    tmp_path: Path,
     capsys,
 ) -> None:
-    """文件表格应转义控制字符，并避免跨页重复输出同一文件。"""
-    page = RemoteFilePage(
-        files=(
-            RemoteFile(
-                file_id=1,
-                parent_cid=0,
-                name="报告\t最终\n版.txt",
-                size=12,
-                sha1="ABC",
-            ),
-        ),
-        offset=0,
-        limit=100,
-        total=1,
-        next_offset=None,
+    """list 递归重复模式应跨子目录按 SHA1 分组，且不输出文件夹行。"""
+    tokens = SimpleNamespace(access_token="access")
+
+    class FakeUploader:
+        """返回一个子目录及跨目录重复文件的客户端替身。"""
+
+        def __init__(self, access_token: str) -> None:
+            assert access_token == "access"
+
+        def list_child_folders(
+            self,
+            parent_cid: int,
+            *,
+            max_results: int | None = None,
+        ) -> list[RemoteFolder]:
+            """返回固定的单层目录树。"""
+            folders = {
+                9: [RemoteFolder(cid=10, parent_cid=9, name="子目录")],
+                10: [],
+            }[parent_cid]
+            return folders if max_results is None else folders[:max_results]
+
+        def list_files_page(
+            self,
+            parent_cid: int,
+            *,
+            offset: int,
+            limit: int,
+        ) -> RemoteFilePage:
+            """在父子目录分别返回相同 SHA1 的单页文件。"""
+            files = {
+                9: [RemoteFile(1, 9, "a.bin", 3, "SAME")],
+                10: [RemoteFile(2, 10, "b.bin", 3, "SAME")],
+            }[parent_cid]
+            return RemoteFilePage(
+                files=tuple(files),
+                offset=offset,
+                limit=limit,
+                total=len(files),
+                next_offset=None,
+            )
+
+    monkeypatch.setattr(cli, "load_tokens", lambda _path: tokens)
+    monkeypatch.setattr(cli, "OpenUploader", FakeUploader)
+
+    exit_code = cli.run(
+        [
+            "list",
+            "--cid",
+            "9",
+            "--recursive",
+            "--duplicates",
+            "--all",
+            "--tokens",
+            str(tmp_path / "tokens.json"),
+        ]
     )
-    seen: set[int] = set()
 
-    assert cli.print_remote_file_page(page, seen=seen) == 1
-    assert cli.print_remote_file_page(page, seen=seen) == 0
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "folder\t" not in captured.out
+    assert "file\t1\t9\t3\tSAME\ta.bin" in captured.out
+    assert "file\t2\t10\t3\tSAME\tb.bin" in captured.out
+    assert "发现 1 组重复文件" in captured.err
 
-    output = capsys.readouterr().out
-    assert output == "1\t0\t12\tABC\t报告\\t最终\\n版.txt\n"
+
+def test_list_defaults_to_one_bounded_page(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    """普通 list 默认最多请求并输出 100 条，不应继续读取下一页。"""
+    tokens = SimpleNamespace(access_token="access")
+    requested_limits: list[int] = []
+
+    class FakeUploader:
+        """记录文件分页请求且声明远端仍有后续数据。"""
+
+        def __init__(self, access_token: str) -> None:
+            assert access_token == "access"
+
+        def list_files_page(
+            self,
+            parent_cid: int,
+            *,
+            offset: int,
+            limit: int,
+        ) -> RemoteFilePage:
+            """返回恰好填满默认预算的一页文件。"""
+            assert parent_cid == 9
+            requested_limits.append(limit)
+            files = tuple(
+                RemoteFile(index, 9, f"file-{index}.dat", 1, f"SHA{index}")
+                for index in range(1, 101)
+            )
+            return RemoteFilePage(files, offset, limit, 200, 100)
+
+    monkeypatch.setattr(cli, "load_tokens", lambda _path: tokens)
+    monkeypatch.setattr(cli, "OpenUploader", FakeUploader)
+
+    exit_code = cli.run(
+        [
+            "list",
+            "--cid",
+            "9",
+            "--type",
+            "file",
+            "--tokens",
+            str(tmp_path / "tokens.json"),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert requested_limits == [100]
+    assert captured.out.count("\n") == 101
+    assert "最多输出 100 条" in captured.err
