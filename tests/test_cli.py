@@ -147,6 +147,33 @@ def test_files_parser_defaults_to_bounded_page_and_supports_search() -> None:
     assert search_all.all is True
 
 
+def test_extended_command_parsers_expose_safe_workflow_options() -> None:
+    """扩展命令应提供强校验、本地清理、冲突策略和显式回收站确认。"""
+    parser = cli.build_parser()
+
+    upload = parser.parse_args(
+        [
+            "upload",
+            "file.bin",
+            "--cid",
+            "9",
+            "--on-conflict",
+            "rename",
+            "--delete-source-after-verify",
+            "--retry",
+            "2",
+        ]
+    )
+    sync = parser.parse_args(["sync", "folder", "--remote-dir", "/备份"])
+    trash = parser.parse_args(["trash", "123", "--parent-cid", "9", "--yes"])
+
+    assert upload.on_conflict == "rename"
+    assert upload.delete_source_after_verify is True
+    assert upload.retry == 2
+    assert sync.on_conflict == "verify"
+    assert trash.yes is True
+
+
 def test_print_remote_file_page_escapes_names_and_deduplicates(
     capsys,
 ) -> None:

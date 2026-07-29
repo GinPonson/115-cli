@@ -9,8 +9,15 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-from .uploader import OpenUploader, RemoteFilePage, RemoteFolder, upload_file
 from .auth import OpenAuthClient, TokenStore
+from .uploader import OpenUploader, RemoteFilePage, RemoteFolder
+from .workflow import (
+    VerifiedUpload,
+    append_manifest,
+    finalize_local_source,
+    find_verified_remote,
+    upload_and_verify,
+)
 
 DEFAULT_TOKEN_PATH = Path.home() / ".config" / "u115-uploader" / "tokens.json"
 
@@ -253,6 +260,74 @@ def print_remote_file_page(page: RemoteFilePage, *, seen: set[int]) -> int:
     return printed
 
 
+def _add_destination_arguments(parser: argparse.ArgumentParser) -> None:
+    """为需要目标目录的命令添加互斥路径/CID 参数。
+
+    Args:
+        parser: 要扩展的子命令解析器。
+    """
+    destination = parser.add_mutually_exclusive_group()
+    destination.add_argument("--cid", type=nonnegative_integer, help="115 目标目录 CID")
+    destination.add_argument(
+        "--remote-dir",
+        metavar="PATH",
+        help="115 目标目录绝对路径，例如 /备份/照片；默认根目录",
+    )
+
+
+def _add_upload_options(parser: argparse.ArgumentParser) -> None:
+    """为 upload 与 sync 添加共享的安全上传选项。
+
+    Args:
+        parser: upload 或 sync 子命令解析器。
+    """
+    parser.add_argument(
+        "files",
+        nargs="+",
+        type=Path,
+        help="要上传的文件、文件夹或通配符；文件夹将递归上传",
+    )
+    _add_destination_arguments(parser)
+    parser.add_argument(
+        "--part-size",
+        type=positive_mebibytes,
+        default=32 * 1024 * 1024,
+        metavar="MiB",
+        help="OSS 分片大小，默认 32 MiB",
+    )
+    parser.add_argument(
+        "--on-conflict",
+        choices=("error", "skip", "verify", "rename"),
+        default="error",
+        help="远端同名文件策略；upload 默认 error，sync 默认 verify",
+    )
+    parser.add_argument(
+        "--retry",
+        type=nonnegative_integer,
+        default=0,
+        metavar="N",
+        help="仅对网络传输错误额外重试 N 次",
+    )
+    local_action = parser.add_mutually_exclusive_group()
+    local_action.add_argument(
+        "--delete-source-after-verify",
+        action="store_true",
+        help="远端大小和 SHA1 强校验成功后删除本地源文件",
+    )
+    local_action.add_argument(
+        "--move-source-after-verify",
+        type=Path,
+        metavar="DIR",
+        help="远端强校验成功后把本地源文件移入 DIR",
+    )
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        metavar="JSONL",
+        help="把每个成功结果追加到 JSON Lines 审计文件",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """创建 CLI 参数解析器。"""
     parser = argparse.ArgumentParser(
@@ -273,30 +348,33 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PNG",
         help="将认证二维码同时导出为 PNG 图片",
     )
-    upload_parser = subparsers.add_parser("upload", help="上传一个或多个本地文件")
-    upload_parser.add_argument(
-        "files",
-        nargs="+",
-        type=Path,
-        help="要上传的文件、文件夹或通配符；文件夹将递归上传",
+    upload_parser = subparsers.add_parser("upload", help="上传并强校验本地文件")
+    _add_upload_options(upload_parser)
+    sync_parser = subparsers.add_parser("sync", help="上传缺失文件并校验已存在文件")
+    _add_upload_options(sync_parser)
+    sync_parser.set_defaults(on_conflict="verify")
+    verify_parser = subparsers.add_parser("verify", help="强校验本地文件是否已存在于 115")
+    verify_parser.add_argument("files", nargs="+", type=Path, help="要校验的本地文件或通配符")
+    _add_destination_arguments(verify_parser)
+    verify_parser.add_argument("--manifest", type=Path, metavar="JSONL", help="追加校验结果")
+    duplicates_parser = subparsers.add_parser(
+        "duplicates",
+        help="按 SHA1 列出指定 115 目录中的重复文件",
     )
-    destination = upload_parser.add_mutually_exclusive_group()
-    destination.add_argument(
-        "--cid",
-        type=int,
-        help="115 目标目录 CID",
+    duplicates_parser.add_argument("path", nargs="?", default="/", help="115 目录路径")
+    duplicates_parser.add_argument("--cid", type=nonnegative_integer, help="115 目录 CID")
+    trash_parser = subparsers.add_parser("trash", help="按精确文件 ID 移入 115 回收站")
+    trash_parser.add_argument("file_ids", nargs="+", type=nonnegative_integer, help="文件 ID")
+    trash_parser.add_argument(
+        "--parent-cid",
+        required=True,
+        type=nonnegative_integer,
+        help="这些文件当前所在的父目录 CID",
     )
-    destination.add_argument(
-        "--remote-dir",
-        metavar="PATH",
-        help="115 目标目录绝对路径，例如 /备份/照片；默认根目录",
-    )
-    upload_parser.add_argument(
-        "--part-size",
-        type=positive_mebibytes,
-        default=32 * 1024 * 1024,
-        metavar="MiB",
-        help="OSS 分片大小，默认 32 MiB",
+    trash_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="确认执行回收站操作；缺少时拒绝执行",
     )
     folders_parser = subparsers.add_parser(
         "folders",
@@ -363,6 +441,10 @@ def build_parser() -> argparse.ArgumentParser:
     for command_parser in (
         login_parser,
         upload_parser,
+        sync_parser,
+        verify_parser,
+        duplicates_parser,
+        trash_parser,
         folders_parser,
         files_parser,
     ):
@@ -390,7 +472,7 @@ def run(argv: Sequence[str] | None = None) -> int:
     # 最后一个参数必须是不存在的绝对本地路径，才会被解释为 115 路径，避免误判本地文件。
     if (
         raw_argv
-        and raw_argv[0] == "upload"
+        and raw_argv[0] in {"upload", "sync"}
         and "--remote-dir" not in raw_argv
         and "--cid" not in raw_argv
         and len(raw_argv) >= 3
@@ -508,27 +590,122 @@ def run(argv: Sequence[str] | None = None) -> int:
             print(summary, file=sys.stderr)
             return 0
 
+        if args.command == "duplicates":
+            if args.cid is not None and args.path != "/":
+                raise ValueError("目录路径与 --cid 不能同时指定")
+            tokens = load_tokens(token_path)
+            uploader = OpenUploader(tokens.access_token)
+            parent_cid = (
+                args.cid
+                if args.cid is not None
+                else uploader.resolve_remote_dir(args.path)
+            )
+            groups: dict[str, list] = {}
+            for remote_file in uploader.list_all_files(parent_cid):
+                if remote_file.sha1:
+                    groups.setdefault(remote_file.sha1, []).append(remote_file)
+            duplicate_groups = [
+                group for group in groups.values() if len(group) > 1
+            ]
+            print("SHA1\tFILE_ID\tPARENT_CID\tSIZE\tNAME")
+            for group in sorted(duplicate_groups, key=lambda items: items[0].sha1):
+                for remote_file in group:
+                    print(
+                        f"{remote_file.sha1}\t{remote_file.file_id}\t"
+                        f"{remote_file.parent_cid}\t{remote_file.size}\t"
+                        f"{_terminal_field(remote_file.name)}"
+                    )
+            print(f"发现 {len(duplicate_groups)} 组重复文件", file=sys.stderr)
+            return 0
+
+        if args.command == "trash":
+            if not args.yes:
+                raise ValueError("回收站操作必须显式指定 --yes")
+            if any(file_id <= 0 for file_id in args.file_ids):
+                raise ValueError("文件 ID 必须为正整数")
+            tokens = load_tokens(token_path)
+            uploader = OpenUploader(tokens.access_token)
+            for file_id in args.file_ids:
+                uploader.trash_file(file_id, args.parent_cid)
+                print(f"已移入 115 回收站：{file_id}")
+            return 0
+
+        if args.command == "verify":
+            sources = expand_upload_sources(args.files)
+            tokens = load_tokens(token_path)
+            uploader = OpenUploader(tokens.access_token)
+            parent_cid = (
+                args.cid
+                if args.cid is not None
+                else uploader.resolve_remote_dir(args.remote_dir or "/")
+            )
+            for source in sources:
+                remote = find_verified_remote(
+                    uploader,
+                    source,
+                    parent_cid=parent_cid,
+                )
+                print(
+                    f"校验通过：{source} -> "
+                    f"file_id={remote.file_id}, sha1={remote.sha1}"
+                )
+                if args.manifest is not None:
+                    append_manifest(
+                        args.manifest,
+                        VerifiedUpload(source, remote, False, False),
+                        action="verified",
+                    )
+            return 0
+
         # 登录态不存在时主动生成二维码；登录成功后 OAuth tokens 会写回文件。
         # 已有 access token 临近过期时，认证模块会先刷新并原子保存新令牌。
         sources = expand_upload_sources(args.files)
+        if args.on_conflict == "skip" and (
+            args.delete_source_after_verify
+            or args.move_source_after_verify is not None
+        ):
+            raise ValueError("skip 未执行 SHA1 校验，不能据此删除或移动本地源文件")
         tokens = load_tokens(token_path)
+        uploader = OpenUploader(tokens.access_token)
+        parent_cid = (
+            args.cid
+            if args.cid is not None
+            else uploader.resolve_remote_dir(args.remote_dir or "/")
+        )
         for index, source in enumerate(sources, start=1):
             if len(sources) > 1:
                 print(f"[{index}/{len(sources)}] 准备上传：{source}")
-            result = upload_file(
-                tokens.access_token,
+            verified = upload_and_verify(
+                uploader,
                 source,
-                cid=args.cid,
-                remote_dir=args.remote_dir,
+                parent_cid=parent_cid,
                 part_size=args.part_size,
+                conflict=args.on_conflict,
+                retries=args.retry,
                 # print 默认换行；进度模块自身使用 \r，保持无额外第三方 UI 依赖。
                 progress_output=lambda text: print(text, end="", flush=True),
             )
-            print()
-            if result.instant:
-                print(f"上传完成（秒传）：{source}")
+            if verified.uploaded:
+                print()
+                mode = "秒传并校验" if verified.instant else "上传并校验"
+                print(f"{mode}完成：{source} -> file_id={verified.remote.file_id}")
             else:
-                print(f"上传完成：{source}")
+                print(f"远端已存在并处理：{source} -> file_id={verified.remote.file_id}")
+            moved = finalize_local_source(
+                source,
+                delete_after_verify=args.delete_source_after_verify,
+                move_after_verify=args.move_source_after_verify,
+            )
+            if args.delete_source_after_verify:
+                print(f"已删除本地源文件：{source}")
+            elif moved is not None:
+                print(f"已移动本地源文件：{source} -> {moved}")
+            if args.manifest is not None:
+                append_manifest(
+                    args.manifest,
+                    verified,
+                    action="uploaded" if verified.uploaded else "skipped",
+                )
         return 0
     except KeyboardInterrupt:
         print("\n操作已取消；已完成的 OSS 分片可供本次上传对象续传。", file=sys.stderr)

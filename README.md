@@ -137,6 +137,41 @@ uv run u115 upload /path/to/file.bin --cid 123456 --part-size 64
 
 `--remote-dir` 与 `--cid` 不能同时使用。不指定时上传到根目录。
 
+每个文件上传后都会重新读取目标目录，并同时核对远端文件名、大小和 SHA1。只有三项
+完全一致才算完成。需要在强校验后删除本地源文件时，显式添加：
+
+```bash
+uv run u115 upload "/archive/*.mp4" \
+  --remote-dir "/视频" \
+  --delete-source-after-verify
+```
+
+更保守的做法是把已校验文件移动到本地归档目录：
+
+```bash
+uv run u115 upload "/archive/*.mp4" \
+  --remote-dir "/视频" \
+  --move-source-after-verify "/archive/uploaded"
+```
+
+同名文件策略由 `--on-conflict` 控制：
+
+- `error`：默认策略；发现同名文件立即报错。
+- `verify`：大小和 SHA1 一致则跳过上传，不一致则报错。
+- `skip`：不校验直接跳过；不能与本地删除或移动选项一起使用。
+- `rename`：使用 `文件名 (N).扩展名` 上传，并对新名称执行强校验。
+
+仅对网络传输错误进行有限重试，并把成功结果追加到 JSON Lines manifest：
+
+```bash
+uv run u115 upload "/archive/*.mp4" \
+  --remote-dir "/视频" \
+  --retry 2 \
+  --manifest "./upload-manifest.jsonl"
+```
+
+callback、SHA1、冲突或其他业务错误不会重试，避免掩盖协议问题。
+
 如果没有提前执行 `login`，第一次执行 `upload` 时也会自动显示二维码并等待登录。
 
 上传时使用自定义登录态文件：
@@ -144,6 +179,43 @@ uv run u115 upload /path/to/file.bin --cid 123456 --part-size 64
 ```bash
 uv run u115 upload file.bin --tokens /secure/path/115-tokens.json
 ```
+
+## 同步与独立校验
+
+`sync` 使用与 `upload` 相同的上传流程，但默认冲突策略为 `verify`：远端已存在且
+大小、SHA1 一致时跳过，缺失时上传，不一致时明确失败。
+
+```bash
+uv run u115 sync "/archive/*.mp4" --remote-dir "/视频"
+```
+
+不上传，只确认本地文件是否已经完整存在于指定 115 目录：
+
+```bash
+uv run u115 verify "/archive/file.mp4" --remote-dir "/视频"
+```
+
+`verify` 同样支持 `--cid`、通配符和 `--manifest`。
+
+## 重复文件与回收站
+
+按 SHA1 查找指定目录中的重复文件：
+
+```bash
+uv run u115 duplicates "/视频"
+uv run u115 duplicates --cid 123456
+```
+
+该命令只报告重复组，不自动删除。远端删除使用精确文件 ID，并移动到 115 回收站：
+
+```bash
+uv run u115 trash 3483568169358984581 \
+  --parent-cid 3392823418375834914 \
+  --yes
+```
+
+`trash` 不接受文件名或模糊搜索，必须同时提供文件当前父 CID 和 `--yes`；它不会执行
+回收站永久清空。
 
 ## 文件夹列表与检索
 
@@ -238,6 +310,10 @@ uv run u115 files --search ".iso" --offset 500 --limit 500 --all
 uv run u115 --help
 uv run u115 login --help
 uv run u115 upload --help
+uv run u115 sync --help
+uv run u115 verify --help
+uv run u115 duplicates --help
+uv run u115 trash --help
 uv run u115 folders --help
 uv run u115 files --help
 ```
