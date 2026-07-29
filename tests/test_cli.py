@@ -6,7 +6,8 @@ from types import SimpleNamespace
 import pytest
 
 from u115_uploader import cli
-from u115_uploader.uploader import RemoteFile, RemoteFilePage, RemoteFolder
+from u115_uploader.uploader import RemoteFile, RemoteFilePage, RemoteFolder, UploadError
+from u115_uploader.workflow import VerifiedUpload
 
 
 def test_load_tokens_uses_local_auth_flow(
@@ -317,3 +318,61 @@ def test_upload_returns_no_work_when_every_glob_is_unmatched(
     assert "已跳过未匹配通配符" in captured.err
     assert "未执行任何操作" in captured.err
     assert "操作失败" not in captured.err
+
+
+def test_upload_continues_after_single_file_failure_and_returns_nonzero(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    """单文件失败后应继续处理后续文件，并以非零状态汇总批次结果。"""
+    first = tmp_path / "first.bin"
+    second = tmp_path / "second.bin"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    manifest = tmp_path / "manifest.jsonl"
+    tokens = SimpleNamespace(access_token="access")
+    processed: list[Path] = []
+
+    class FakeUploader:
+        """只负责解析测试目标目录的上传器替身。"""
+
+        def __init__(self, access_token: str) -> None:
+            assert access_token == "access"
+
+        def resolve_remote_dir(self, remote_dir: str) -> int:
+            """返回固定测试 CID。"""
+            assert remote_dir == "/target"
+            return 9
+
+    def fake_upload_and_verify(_uploader, source: Path, **_kwargs):
+        """首文件失败，次文件返回已校验结果。"""
+        processed.append(source)
+        if source == first.resolve():
+            raise UploadError("模拟单文件失败")
+        remote = RemoteFile(2, 9, source.name, source.stat().st_size, "SHA1")
+        return VerifiedUpload(source, remote, True, False)
+
+    monkeypatch.setattr(cli, "load_tokens", lambda _path: tokens)
+    monkeypatch.setattr(cli, "OpenUploader", FakeUploader)
+    monkeypatch.setattr(cli, "upload_and_verify", fake_upload_and_verify)
+
+    exit_code = cli.run([
+        "upload",
+        str(first),
+        str(second),
+        "--remote-dir",
+        "/target",
+        "--manifest",
+        str(manifest),
+        "--tokens",
+        str(tmp_path / "tokens.json"),
+    ])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert processed == [first.resolve(), second.resolve()]
+    assert "文件处理失败" in captured.err
+    content = manifest.read_text(encoding="utf-8")
+    assert '"action": "failed"' in content
+    assert '"action": "uploaded"' in content

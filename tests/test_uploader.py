@@ -4,7 +4,13 @@ from pathlib import Path
 
 import httpx
 
-from u115_uploader.uploader import OpenUploader
+import pytest
+
+from u115_uploader.uploader import (
+    MultipartCleanupError,
+    OpenUploader,
+    UploadCredentialExpiredError,
+)
 
 
 class FakePutResult:
@@ -80,6 +86,66 @@ class FakeBucket:
     def abort_multipart_upload(self, key, upload_id):
         """测试正常路径不应调用中止。"""
         raise AssertionError("不应中止成功上传")
+
+
+class FakeExpiredBucket(FakeBucket):
+    """模拟 STS 过期且 multipart 清理也失败。"""
+
+    def upload_part(self, key, upload_id, part_number, chunk):
+        """首个分片返回包含敏感字段的 STS 过期错误。"""
+        raise RuntimeError({
+            "details": {
+                "Code": "SecurityTokenExpired",
+                "Message": "expired",
+                "RequestId": "upload-request",
+                "SecurityToken": "secret-upload-token",
+            }
+        })
+
+    def abort_multipart_upload(self, key, upload_id):
+        """清理请求同样返回包含 AccessKey 的错误。"""
+        raise RuntimeError({
+            "details": {
+                "Code": "InvalidAccessKeyId",
+                "Message": "invalid",
+                "RequestId": "cleanup-request",
+                "OSSAccessKeyId": "secret-access-key",
+            }
+        })
+
+
+def test_multipart_cleanup_preserves_primary_error_and_redacts_credentials(
+    tmp_path: Path,
+) -> None:
+    """清理失败不得覆盖 STS 过期主因，错误文本也不得泄露临时凭证。"""
+    source = tmp_path / "multipart.bin"
+    source.write_bytes(b"a" * (200 * 1024))
+    bucket = FakeExpiredBucket()
+    uploader = OpenUploader("token", bucket_factory=lambda *_args: bucket)
+
+    with pytest.raises(MultipartCleanupError) as captured:
+        uploader._upload_oss(
+            source,
+            bucket_name="bucket",
+            object_key="object",
+            callback="callback",
+            callback_var="vars",
+            sts={
+                "endpoint": "https://oss.example.com",
+                "AccessKeyId": "id",
+                "AccessKeySecret": "secret",
+                "SecurityToken": "sts",
+            },
+            part_size=100 * 1024,
+            progress_output=lambda _line: None,
+        )
+
+    assert isinstance(captured.value.__cause__, UploadCredentialExpiredError)
+    message = str(captured.value)
+    assert "临时上传凭证已过期" in message
+    assert "InvalidAccessKeyId" in message
+    assert "secret-upload-token" not in message
+    assert "secret-access-key" not in message
 
 
 def test_upload_sends_preid_and_handles_instant(tmp_path: Path) -> None:

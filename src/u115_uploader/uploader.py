@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,6 +37,105 @@ def _load_oss2() -> Any:
 
 class UploadError(RuntimeError):
     """上传协议、业务状态或 OSS 完成确认错误。"""
+
+
+class UploadCredentialExpiredError(UploadError):
+    """OSS 临时上传凭证已过期，可以重新初始化上传后重试。"""
+
+
+class MultipartCleanupError(UploadError):
+    """上传失败后，OSS multipart 清理操作也失败。"""
+
+
+_SENSITIVE_ERROR_KEYS = {
+    "accesskeyid",
+    "accesskeysecret",
+    "authorization",
+    "ossaccesskeyid",
+    "securitytoken",
+    "access_token",
+    "refresh_token",
+}
+_SENSITIVE_TEXT_PATTERN = re.compile(
+    r"(?i)(SecurityToken|AccessKeyId|AccessKeySecret|OSSAccessKeyId|"
+    r"access_token|refresh_token|Authorization)"
+    r"(?P<separator>['\"\s:=]+)(?P<value>[^,}\s'\"]+)"
+)
+_BEARER_PATTERN = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
+
+
+def _redact_error_text(value: object) -> str:
+    """对非结构化异常文本中的常见凭证字段进行兜底脱敏。"""
+    text = str(value)
+    text = _SENSITIVE_TEXT_PATTERN.sub(
+        lambda match: f"{match.group(1)}{match.group('separator')}<redacted>",
+        text,
+    )
+    return _BEARER_PATTERN.sub("Bearer <redacted>", text)
+
+
+def _exception_details(error: BaseException) -> dict[str, Any]:
+    """从第三方 SDK 异常中提取结构化详情。
+
+    Args:
+        error: 可能包含 ``details`` 或字典参数的异常。
+
+    Returns:
+        可安全继续检查的详情字典；不存在时返回空字典。
+    """
+    details = getattr(error, "details", None)
+    if isinstance(details, dict):
+        return details
+    for argument in getattr(error, "args", ()):
+        if isinstance(argument, dict):
+            nested = argument.get("details")
+            return nested if isinstance(nested, dict) else argument
+    return {}
+
+
+def _safe_error_details(error: BaseException) -> dict[str, Any]:
+    """生成移除凭证字段后的异常详情。"""
+    return {
+        str(key): "<redacted>" if str(key).lower() in _SENSITIVE_ERROR_KEYS else value
+        for key, value in _exception_details(error).items()
+    }
+
+
+def format_safe_error(error: BaseException) -> str:
+    """格式化不包含 OAuth 或 OSS 临时凭证的错误信息。
+
+    Args:
+        error: 需要展示或写入审计日志的异常。
+
+    Returns:
+        已脱敏、适合用户日志的错误文本。
+    """
+    if isinstance(error, UploadError):
+        return _redact_error_text(error)
+    details = _safe_error_details(error)
+    if details:
+        code = details.get("Code") or details.get("code")
+        message = details.get("Message") or details.get("message")
+        request_id = details.get("RequestId") or details.get("request_id")
+        fields = [
+            f"code={code}" if code else "",
+            f"message={message}" if message else "",
+            f"request_id={request_id}" if request_id else "",
+        ]
+        summary = ", ".join(field for field in fields if field)
+        return f"{type(error).__name__}: {summary or '远端请求失败'}"
+    return f"{type(error).__name__}: {_redact_error_text(error)}"
+
+
+def _normalize_oss_error(error: BaseException) -> UploadError:
+    """把 OSS SDK 异常转换为稳定且脱敏的项目异常。"""
+    details = _exception_details(error)
+    code = str(details.get("Code") or details.get("code") or "")
+    request_id = details.get("RequestId") or details.get("request_id")
+    suffix = f"（request_id={request_id}）" if request_id else ""
+    if code == "SecurityTokenExpired":
+        return UploadCredentialExpiredError(f"OSS 临时上传凭证已过期{suffix}")
+    return UploadError(f"OSS 请求失败：{format_safe_error(error)}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -896,11 +996,16 @@ class OpenUploader:
         total = source.stat().st_size
         progress = ProgressReporter(total, progress_output)
         if total <= part_size:
-            with source.open("rb") as stream:
-                put_result = bucket.put_object(object_key, stream, headers=headers)
-            self._require_callback_success(put_result)
-            progress.add(total)
-            return
+            try:
+                with source.open("rb") as stream:
+                    put_result = bucket.put_object(object_key, stream, headers=headers)
+                self._require_callback_success(put_result)
+                progress.add(total)
+                return
+            except Exception as error:
+                if isinstance(error, UploadError):
+                    raise
+                raise _normalize_oss_error(error) from error
 
         upload_id = ""
         multipart_completed = False
@@ -941,12 +1046,37 @@ class OpenUploader:
             )
             multipart_completed = True
             self._require_callback_success(complete_result)
-        except BaseException:
+        except BaseException as error:
+            if not isinstance(error, Exception):
+                # 中断信号仍需原样传播；清理失败只作为附注，不能改变控制流语义。
+                if upload_id and not multipart_completed:
+                    try:
+                        bucket.abort_multipart_upload(object_key, upload_id)
+                    except Exception as cleanup_error:
+                        error.add_note(
+                            "multipart 清理失败："
+                            f"{format_safe_error(_normalize_oss_error(cleanup_error))}"
+                        )
+                raise
+            # 先转换可能携带 STS 明文的 SDK 异常，确保上层日志不会泄露凭证。
+            upload_error = error if isinstance(error, UploadError) else _normalize_oss_error(error)
             # Complete 成功后的 callback 业务失败不能再 Abort，否则 NoSuchUpload
             # 会覆盖真正的 115 错误；只有尚未完成的会话需要主动清理。
             if upload_id and not multipart_completed:
-                bucket.abort_multipart_upload(object_key, upload_id)
-            raise
+                try:
+                    bucket.abort_multipart_upload(object_key, upload_id)
+                except BaseException as cleanup_error:
+                    safe_cleanup_error = (
+                        cleanup_error
+                        if isinstance(cleanup_error, UploadError)
+                        else _normalize_oss_error(cleanup_error)
+                    )
+                    raise MultipartCleanupError(
+                        "OSS 上传失败，且 multipart 清理失败；"
+                        f"上传错误：{format_safe_error(upload_error)}；"
+                        f"清理错误：{format_safe_error(safe_cleanup_error)}"
+                    ) from upload_error
+            raise upload_error from error
 
     @staticmethod
     def _require_callback_success(result: Any) -> None:

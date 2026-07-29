@@ -4,9 +4,15 @@ from pathlib import Path
 
 import pytest
 
-from u115_uploader.uploader import RemoteFile, UploadError, UploadResult
+from u115_uploader.uploader import (
+    RemoteFile,
+    UploadCredentialExpiredError,
+    UploadError,
+    UploadResult,
+)
 from u115_uploader.workflow import (
     VerifiedUpload,
+    append_failure_manifest,
     append_manifest,
     finalize_local_source,
     find_verified_remote,
@@ -134,3 +140,56 @@ def test_manifest_is_json_lines_without_protocol_response(tmp_path: Path) -> Non
     assert '"file_id": 10' in content
     assert '"action": "uploaded"' in content
     assert "response" not in content
+
+
+def test_upload_retries_expired_sts_with_fresh_upload_attempt(tmp_path: Path) -> None:
+    """STS 过期应按既有重试预算重新调用完整的单文件上传入口。"""
+    source = tmp_path / "retry.bin"
+    source.write_bytes(b"retry")
+    uploader = FakeWorkflowUploader([])
+    original_upload = uploader.upload
+    attempts = 0
+
+    def upload_with_expired_first_attempt(*args, **kwargs):
+        """首次模拟 STS 过期，第二次沿用正常上传替身。"""
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise UploadCredentialExpiredError("OSS 临时上传凭证已过期")
+        return original_upload(*args, **kwargs)
+
+    uploader.upload = upload_with_expired_first_attempt
+    verified = upload_and_verify(
+        uploader,
+        source,
+        parent_cid=9,
+        part_size=1024,
+        conflict="error",
+        retries=1,
+        progress_output=lambda _text: None,
+    )
+
+    assert verified.uploaded is True
+    assert attempts == 2
+
+
+def test_failure_manifest_records_safe_structured_error(tmp_path: Path) -> None:
+    """失败 manifest 应包含阶段与错误类型，但不能包含协议凭证。"""
+    manifest = tmp_path / "manifest.jsonl"
+    source = tmp_path / "failed.bin"
+    source.write_bytes(b"failed")
+
+    append_failure_manifest(
+        manifest,
+        source,
+        UploadCredentialExpiredError("OSS 临时上传凭证已过期"),
+        stage="upload",
+        remote_dir="/rplay/test",
+        parent_cid=9,
+    )
+
+    content = manifest.read_text(encoding="utf-8")
+    assert '"action": "failed"' in content
+    assert '"stage": "upload"' in content
+    assert '"error_type": "UploadCredentialExpiredError"' in content
+    assert "SecurityToken" not in content

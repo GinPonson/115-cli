@@ -10,9 +10,10 @@ from pathlib import Path
 from typing import Sequence
 
 from .auth import OpenAuthClient, TokenStore
-from .uploader import OpenUploader, RemoteFolder
+from .uploader import OpenUploader, RemoteFolder, format_safe_error
 from .workflow import (
     VerifiedUpload,
+    append_failure_manifest,
     append_manifest,
     finalize_local_source,
     find_verified_remote,
@@ -705,47 +706,66 @@ def run(argv: Sequence[str] | None = None) -> int:
             if args.cid is not None
             else uploader.resolve_remote_dir(args.remote_dir or "/")
         )
+        failed_count = 0
         for index, source in enumerate(sources, start=1):
             if len(sources) > 1:
                 print(f"[{index}/{len(sources)}] 准备上传：{source}")
-            verified = upload_and_verify(
-                uploader,
-                source,
-                parent_cid=parent_cid,
-                part_size=args.part_size,
-                conflict=args.on_conflict,
-                retries=args.retry,
-                # print 默认换行；进度模块自身使用 \r，保持无额外第三方 UI 依赖。
-                progress_output=lambda text: print(text, end="", flush=True),
-            )
-            if verified.uploaded:
-                print()
-                mode = "秒传并校验" if verified.instant else "上传并校验"
-                print(f"{mode}完成：{source} -> file_id={verified.remote.file_id}")
-            else:
-                print(f"远端已存在并处理：{source} -> file_id={verified.remote.file_id}")
-            moved = finalize_local_source(
-                source,
-                delete_after_verify=args.delete_source_after_verify,
-                move_after_verify=args.move_source_after_verify,
-            )
-            if args.delete_source_after_verify:
-                print(f"已删除本地源文件：{source}")
-            elif moved is not None:
-                print(f"已移动本地源文件：{source} -> {moved}")
-            if args.manifest is not None:
-                append_manifest(
-                    args.manifest,
-                    verified,
-                    action="uploaded" if verified.uploaded else "skipped",
+            stage = "upload"
+            try:
+                verified = upload_and_verify(
+                    uploader,
+                    source,
+                    parent_cid=parent_cid,
+                    part_size=args.part_size,
+                    conflict=args.on_conflict,
+                    retries=args.retry,
+                    # print 默认换行；进度模块自身使用 \r，保持无额外第三方 UI 依赖。
+                    progress_output=lambda text: print(text, end="", flush=True),
                 )
-        return 0
+                if verified.uploaded:
+                    print()
+                    mode = "秒传并校验" if verified.instant else "上传并校验"
+                    print(f"{mode}完成：{source} -> file_id={verified.remote.file_id}")
+                else:
+                    print(f"远端已存在并处理：{source} -> file_id={verified.remote.file_id}")
+                stage = "finalize"
+                moved = finalize_local_source(
+                    source,
+                    delete_after_verify=args.delete_source_after_verify,
+                    move_after_verify=args.move_source_after_verify,
+                )
+                if args.delete_source_after_verify:
+                    print(f"已删除本地源文件：{source}")
+                elif moved is not None:
+                    print(f"已移动本地源文件：{source} -> {moved}")
+                if args.manifest is not None:
+                    append_manifest(
+                        args.manifest,
+                        verified,
+                        action="uploaded" if verified.uploaded else "skipped",
+                    )
+            except (OSError, RuntimeError, ValueError) as error:
+                failed_count += 1
+                if args.manifest is not None:
+                    append_failure_manifest(
+                        args.manifest,
+                        source,
+                        error,
+                        stage=stage,
+                        remote_dir=args.remote_dir,
+                        parent_cid=parent_cid,
+                    )
+                print(
+                    f"\n文件处理失败：{source}：{format_safe_error(error)}",
+                    file=sys.stderr,
+                )
+        return 1 if failed_count else 0
     except KeyboardInterrupt:
         print("\n操作已取消；已完成的 OSS 分片可供本次上传对象续传。", file=sys.stderr)
         return 130
     except (OSError, RuntimeError, ValueError) as error:
         # 不输出响应 JSON、令牌、cookies 或 OSS 签名信息，只展示可读错误。
-        print(f"\n操作失败：{error}", file=sys.stderr)
+        print(f"\n操作失败：{format_safe_error(error)}", file=sys.stderr)
         return 1
 
 

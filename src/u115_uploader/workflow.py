@@ -12,7 +12,15 @@ from typing import Literal
 
 import httpx
 
-from .uploader import OpenUploader, RemoteFile, UploadError, UploadResult, _hash_file
+from .uploader import (
+    OpenUploader,
+    RemoteFile,
+    UploadCredentialExpiredError,
+    UploadError,
+    UploadResult,
+    _hash_file,
+    format_safe_error,
+)
 
 ConflictPolicy = Literal["error", "skip", "verify", "rename"]
 
@@ -110,7 +118,7 @@ def _is_retryable(error: BaseException) -> bool:
     """
     current: BaseException | None = error
     while current is not None:
-        if isinstance(current, httpx.TransportError):
+        if isinstance(current, (httpx.TransportError, UploadCredentialExpiredError)):
             return True
         current = current.__cause__
     return False
@@ -247,6 +255,43 @@ def append_manifest(
         "remote": asdict(verified.remote),
         "uploaded": verified.uploaded,
         "instant": verified.instant,
+    }
+    with manifest.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def append_failure_manifest(
+    manifest: Path,
+    source: Path,
+    error: BaseException,
+    *,
+    stage: str,
+    remote_dir: str | None,
+    parent_cid: int,
+) -> None:
+    """追加单文件失败审计记录，且不持久化协议凭证。
+
+    Args:
+        manifest: JSONL 文件路径。
+        source: 失败的本地源文件。
+        error: 已捕获的单文件异常。
+        stage: 失败阶段，例如 ``upload`` 或 ``finalize``。
+        remote_dir: 用户指定的远端目录；使用 CID 时可以为 ``None``。
+        parent_cid: 已解析的目标目录 CID。
+    """
+    manifest = manifest.expanduser().resolve()
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "action": "failed",
+        "source": str(source),
+        "remote_dir": remote_dir,
+        "parent_cid": parent_cid,
+        "stage": stage,
+        "error_type": type(error).__name__,
+        "message": format_safe_error(error),
+        "uploaded": False,
+        "source_deleted": False,
     }
     with manifest.open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
