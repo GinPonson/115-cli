@@ -11,6 +11,27 @@ class FakePutResult:
     """OSS 分片结果。"""
 
     etag = "etag"
+    crc = 123
+
+
+class FakeHttpResponse:
+    """模拟 oss2 底层响应体。"""
+
+    content = b'{"state":true,"code":0}'
+
+
+class FakeOssResponse:
+    """模拟 oss2 响应包装。"""
+
+    status = 200
+    response = FakeHttpResponse()
+
+
+class FakeCompleteResult:
+    """模拟 OSS complete 与 115 callback 同时成功。"""
+
+    status = 200
+    resp = FakeOssResponse()
 
 
 class FakeInitResult:
@@ -50,6 +71,8 @@ class FakeBucket:
         """记录完成请求及其 115 入库回调头。"""
         self.completed = True
         self.complete_headers = headers
+        self.completed_parts = parts
+        return FakeCompleteResult()
 
     def abort_multipart_upload(self, key, upload_id):
         """测试正常路径不应调用中止。"""
@@ -176,6 +199,7 @@ def test_multipart_callback_is_sent_when_completing_upload(tmp_path: Path) -> No
     assert result.instant is False
     assert bucket.init_headers is None
     assert bucket.completed is True
+    assert all(part.part_crc == 123 for part in bucket.completed_parts)
     assert "x-oss-callback" in bucket.complete_headers
     assert "x-oss-callback-var" in bucket.complete_headers
 

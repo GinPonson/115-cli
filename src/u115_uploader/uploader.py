@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic
@@ -779,6 +780,7 @@ class OpenUploader:
             return
 
         upload_id = ""
+        multipart_completed = False
         try:
             upload_id = bucket.init_multipart_upload(object_key).upload_id
             parts: list[oss2.models.PartInfo] = []
@@ -791,22 +793,58 @@ class OpenUploader:
                         part_number,
                         chunk,
                     )
-                    parts.append(oss2.models.PartInfo(part_number, result.etag, size=len(chunk)))
+                    parts.append(
+                        oss2.models.PartInfo(
+                            part_number,
+                            result.etag,
+                            size=len(chunk),
+                            part_crc=result.crc,
+                        )
+                    )
                     progress.add(len(chunk))
                     part_number += 1
-            # OSS 仅在 CompleteMultipartUpload 收到 callback 头时通知 115 入库；
-            # 放在初始化请求只会合并 OSS 对象，115 文件列表不会出现该文件。
-            bucket.complete_multipart_upload(
+            complete_result = bucket.complete_multipart_upload(
                 object_key,
                 upload_id,
                 parts,
-                headers=headers,
+                # p115oss 完成分片时显式使用 text/xml；该值也会参与
+                # OSS callback 请求内容，不能依赖 SDK 的默认 MIME 类型。
+                headers={**headers, "Content-Type": "text/xml"},
             )
+            multipart_completed = True
+            self._require_callback_success(complete_result)
         except BaseException:
-            # 已创建会话但未完成时明确中止，避免遗留无主 OSS 分片占用空间。
-            if upload_id:
+            # Complete 成功后的 callback 业务失败不能再 Abort，否则 NoSuchUpload
+            # 会覆盖真正的 115 错误；只有尚未完成的会话需要主动清理。
+            if upload_id and not multipart_completed:
                 bucket.abort_multipart_upload(object_key, upload_id)
             raise
+
+    @staticmethod
+    def _require_callback_success(result: Any) -> None:
+        """同时校验 OSS HTTP 状态与 115 callback 业务响应。
+
+        OSS 即使成功存储对象，也可能返回 callback 失败；115 callback 还可能以
+        HTTP 200 返回非零业务 code。两者都不能标记为上传成功。
+        """
+        status = int(getattr(result, "status", 0) or 0)
+        if status != 200:
+            raise UploadError(f"OSS 上传完成但 115 回调失败（HTTP {status}）")
+        response = getattr(getattr(result, "resp", None), "response", None)
+        content = getattr(response, "content", b"")
+        if not content:
+            return
+        try:
+            payload = json.loads(content)
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise UploadError("115 上传回调响应格式无效") from error
+        if not isinstance(payload, dict):
+            raise UploadError("115 上传回调响应格式无效")
+        code = int(payload.get("code") or 0)
+        state = payload.get("state")
+        if code != 0 or state in (False, 0):
+            message = payload.get("message") or "115 文件校验失败"
+            raise UploadError(str(message))
 
 
 def upload_file(
