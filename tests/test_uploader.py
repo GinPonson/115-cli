@@ -46,6 +46,7 @@ class FakeBucket:
     def __init__(self) -> None:
         self.put_headers = None
         self.init_headers = None
+        self.init_params = None
         self.complete_headers = None
         self.parts = []
         self.completed = False
@@ -55,11 +56,13 @@ class FakeBucket:
         self.key = key
         self.content = stream.read()
         self.put_headers = headers
+        return FakeCompleteResult()
 
-    def init_multipart_upload(self, key, *, headers=None):
+    def init_multipart_upload(self, key, *, headers=None, params=None):
         """返回固定 multipart upload id。"""
         self.key = key
         self.init_headers = headers
+        self.init_params = params
         return FakeInitResult()
 
     def upload_part(self, key, upload_id, part_number, chunk):
@@ -198,6 +201,7 @@ def test_multipart_callback_is_sent_when_completing_upload(tmp_path: Path) -> No
 
     assert result.instant is False
     assert bucket.init_headers is None
+    assert bucket.init_params == {"sequential": ""}
     assert bucket.completed is True
     assert all(part.part_crc == 123 for part in bucket.completed_parts)
     assert "x-oss-callback" in bucket.complete_headers
@@ -400,3 +404,24 @@ def test_search_files_page_uses_file_filter_and_search_schema() -> None:
     assert page.next_offset is None
     assert captured["search_value"] == "校验"
     assert captured["fc"] == "2"
+
+
+def test_trash_file_uses_exact_file_and_parent_ids() -> None:
+    """回收站请求必须提交调用方确认的精确文件 ID 与父 CID。"""
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["body"] = request.content.decode()
+        return httpx.Response(200, json={"state": True, "data": ["123"]})
+
+    uploader = OpenUploader(
+        "token",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    uploader.trash_file(123, 9)
+
+    assert captured["url"].endswith("/open/ufile/delete")
+    assert "file_ids=123" in captured["body"]
+    assert "parent_id=9" in captured["body"]

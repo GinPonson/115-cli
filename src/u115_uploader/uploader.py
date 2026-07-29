@@ -23,10 +23,21 @@ class UploadError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class UploadResult:
-    """统一上传结果。"""
+    """统一上传结果。
+
+    Attributes:
+        instant: 是否由 115 秒传完成。
+        response: 115 上传初始化响应，仅供协议诊断使用。
+        file_sha1: 上传前计算的本地文件大写 SHA1。
+        target_cid: 实际上传到的父目录 CID。
+        remote_name: 实际提交给 115 的文件名。
+    """
 
     instant: bool
     response: dict[str, Any]
+    file_sha1: str = ""
+    target_cid: int = 0
+    remote_name: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,10 +188,23 @@ class OpenUploader:
         *,
         cid: int | None = None,
         remote_dir: str | None = None,
+        remote_name: str | None = None,
         part_size: int = 32 * 1024 * 1024,
         progress_output: Callable[[str], None] = print,
     ) -> UploadResult:
-        """上传一个本地文件到目标 CID 或远端目录路径。"""
+        """上传一个本地文件到目标 CID 或远端目录路径。
+
+        Args:
+            source: 本地普通文件。
+            cid: 115 目标目录 CID。
+            remote_dir: 115 目标目录绝对路径。
+            remote_name: 可选的远端文件名；默认使用本地文件名。
+            part_size: OSS 分片大小，单位为字节。
+            progress_output: 单行进度输出函数。
+
+        Returns:
+            包含上传模式、SHA1、目标 CID 与远端名称的上传结果。
+        """
         source = source.expanduser().resolve()
         if not source.exists():
             raise FileNotFoundError(f"指定文件不存在：{source}")
@@ -196,8 +220,11 @@ class OpenUploader:
         file_size = source.stat().st_size
         target_cid = self.resolve_remote_dir(remote_dir) if remote_dir is not None else (cid or 0)
         file_sha1, pre_sha1 = _hash_file(source)
+        upload_name = remote_name if remote_name is not None else source.name
+        if not upload_name or "/" in upload_name or "\x00" in upload_name:
+            raise ValueError("远端文件名不能为空，且不能包含 / 或 NUL")
         payload = {
-            "file_name": source.name,
+            "file_name": upload_name,
             "file_size": str(file_size),
             "target": f"U_1_{target_cid}",
             "fileid": file_sha1,
@@ -225,7 +252,7 @@ class OpenUploader:
         if (code, status) == (702, 8):
             raise UploadError("文件签名认证失败")
         if status == 2:
-            return UploadResult(True, data)
+            return UploadResult(True, data, file_sha1, target_cid, upload_name)
         if status != 1:
             raise UploadError(str(data.get("message") or "115 拒绝了上传初始化"))
 
@@ -245,7 +272,63 @@ class OpenUploader:
             part_size=part_size,
             progress_output=progress_output,
         )
-        return UploadResult(False, data)
+        return UploadResult(False, data, file_sha1, target_cid, upload_name)
+
+    def list_all_files(self, parent_cid: int) -> list[RemoteFile]:
+        """读取指定目录内的全部直接文件。
+
+        Args:
+            parent_cid: 目标目录 CID。
+
+        Returns:
+            按 115 文件列表顺序去重后的全部文件。
+
+        Raises:
+            UploadError: 分页未前进或远端响应无效。
+        """
+        files: list[RemoteFile] = []
+        seen: set[int] = set()
+        offset = 0
+        while True:
+            page = self.list_files_page(parent_cid, offset=offset, limit=1150)
+            for remote_file in page.files:
+                if remote_file.file_id not in seen:
+                    seen.add(remote_file.file_id)
+                    files.append(remote_file)
+            if page.next_offset is None:
+                return files
+            if page.next_offset <= offset:
+                raise UploadError("115 文件列表分页偏移未前进")
+            offset = page.next_offset
+
+    def trash_file(self, file_id: int, parent_cid: int) -> None:
+        """把一个精确文件 ID 移入 115 回收站。
+
+        Args:
+            file_id: 要删除的文件 ID，必须为正整数。
+            parent_cid: 文件当前所在父目录 CID。
+
+        Raises:
+            ValueError: ID 参数非法。
+            UploadError: 115 拒绝删除或响应无效。
+        """
+        if file_id <= 0:
+            raise ValueError("文件 ID 必须为正整数")
+        if parent_cid < 0:
+            raise ValueError("父目录 CID 不能为负数")
+        try:
+            response = self.http.post(
+                f"{PRO_API}/open/ufile/delete",
+                headers=self.headers,
+                data={"file_ids": str(file_id), "parent_id": str(parent_cid)},
+            )
+            response.raise_for_status()
+            envelope = response.json()
+        except (httpx.HTTPError, ValueError) as error:
+            raise UploadError("115 回收站请求失败") from error
+        if not isinstance(envelope, dict) or envelope.get("state") not in (True, 1):
+            message = envelope.get("message") if isinstance(envelope, dict) else None
+            raise UploadError(str(message or "115 拒绝把文件移入回收站"))
 
     def resolve_remote_dir(self, remote_dir: str) -> int:
         """将 ``/目录/子目录`` 逐级解析为最终目录 CID。
@@ -775,14 +858,20 @@ class OpenUploader:
         progress = ProgressReporter(total, progress_output)
         if total <= part_size:
             with source.open("rb") as stream:
-                bucket.put_object(object_key, stream, headers=headers)
+                put_result = bucket.put_object(object_key, stream, headers=headers)
+            self._require_callback_success(put_result)
             progress.add(total)
             return
 
         upload_id = ""
         multipart_completed = False
         try:
-            upload_id = bucket.init_multipart_upload(object_key).upload_id
+            upload_id = bucket.init_multipart_upload(
+                object_key,
+                # 115 依赖 OSS 按上传顺序累计文件哈希；缺少该参数时对象虽然合并成功，
+                # callback 仍会因完整文件 SHA1 无效而拒绝入库。
+                params={"sequential": ""},
+            ).upload_id
             parts: list[oss2.models.PartInfo] = []
             with source.open("rb") as stream:
                 part_number = 1
