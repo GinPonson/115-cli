@@ -1,33 +1,43 @@
 # u115-uploader
 
-一个轻量的 Python CLI，用 115 App 扫码登录后，把指定文件上传到 115 网盘。
+A lightweight Python CLI that logs in via the 115 App QR code and uploads
+specified files to your 115 cloud drive.
 
-> English version: [README.en.md](./README.en.md)
+> Chinese version: [README.zh-CN.md](./README.zh-CN.md)
 
-## 功能
+## Features
 
-- 115 开放平台设备码登录、终端二维码和 OAuth token 自动刷新
-- 文件、目录和 `*`、`?`、`**` 通配符批量上传
-- 单 PUT、顺序分片上传、二次签名和 115 callback 入库确认
-- 上传后按文件名、大小、SHA1 强校验
-- 远端已存在相同文件时默认跳过，不重复上传
-- 强校验成功后按需删除或归档本地源文件
-- 统一列出、递归搜索、重复文件检查和精确 ID 回收站操作
-- JSON Lines manifest 审计记录和网络错误有限重试
+- 115 Open Platform device-code login with terminal QR code and automatic
+  OAuth token refresh
+- Batch upload of files, directories, and `*`, `?`, `**` glob patterns
+- Single PUT, sequential multipart upload, secondary signature, and 115
+  callback completion confirmation
+- Strong post-upload verification by file name, size, and SHA1
+- Skips files that already exist remotely with identical content; never
+  uploads duplicates
+- Optionally creates missing remote directory levels explicitly
+- Optional deletion or archival of local source files after strong
+  verification succeeds
+- Unified listing, recursive search, duplicate-file detection, and
+  precise ID-based trash operations
+- JSON Lines manifest audit trail and bounded retry on transient network
+  errors
 
-默认安全语义是：不存在则上传；同名且大小、SHA1 一致则跳过；同名但内容不一致则报错。
-任何 callback、网络、列表或校验错误都不会被当作成功。
+The default semantics are safe by design: upload if the file is missing;
+skip if a remote file with the same name, size, and SHA1 already exists;
+raise an error if the name matches but the content differs. No callback,
+network, listing, or verification error is ever treated as success.
 
-## 安装
+## Installation
 
-需要 Python 3.12+。推荐使用 `uv`：
+Requires Python 3.12 or newer. `uv` is the recommended installer:
 
 ```bash
 cd /path/to/u115-uploader
 uv sync
 ```
 
-将项目注册为当前用户的系统命令：
+To register the project as a system-wide command for the current user:
 
 ```bash
 cd /path/to/u115-uploader
@@ -35,7 +45,7 @@ uv tool install --editable .
 uv tool update-shell
 ```
 
-重新打开终端后可直接使用：
+After opening a new terminal the command is available directly:
 
 ```bash
 u115 --help
@@ -43,16 +53,19 @@ u115 login
 u115 upload "/path/to/input/sample.dat" --remote-dir "/remote-target"
 ```
 
-`--editable` 让命令直接使用当前项目源码，修改代码后无需重复安装。取消注册：
+`--editable` makes the command run straight from the project source, so
+edits do not require reinstallation. To unregister:
 
 ```bash
 uv tool uninstall u115-uploader
 ```
 
-以上安装命令不会由项目测试自动执行，避免测试过程修改当前用户的 PATH 或工具目录。
-不注册系统命令时，开发者仍可在项目目录使用 `uv run u115 ...`。
+The installation commands above are not exercised by the test suite, so
+they cannot mutate the current user's `PATH` or tool directory during
+testing. Without installing, developers can still run `uv run u115 ...`
+from inside the project directory.
 
-## 快速开始
+## Quick Start
 
 ```bash
 u115 login
@@ -60,7 +73,8 @@ u115 upload "/path/to/input/*" --remote-dir "/remote-target"
 u115 list "/remote-target" --type file
 ```
 
-上传成功且远端强校验通过后删除本地源文件：
+Delete local source files after a successful upload and strong remote
+verification:
 
 ```bash
 u115 upload "/path/to/input/*" \
@@ -68,128 +82,158 @@ u115 upload "/path/to/input/*" \
   --delete-source-after-verify
 ```
 
-## 登录
+## Login
 
-首次使用先运行：
+Run this on first use:
 
 ```bash
 u115 login
 ```
 
-终端会显示一个二维码，随后：
+A QR code appears in the terminal. Then:
 
-1. 打开手机上的 **115 App**。
-2. 使用 115 App 的扫一扫扫描终端二维码。
-3. 在手机上点击确认登录。
-4. 等待终端显示 `登录成功`。
+1. Open the **115 App** on your phone.
+2. Use the scanner inside the 115 App to scan the QR code in the terminal.
+3. Tap confirm on the phone.
+4. Wait until the terminal reports `登录成功` (Login successful).
 
-登录成功后，OAuth 登录态默认以 `0600` 权限保存在：
+After a successful login the OAuth session is persisted with `0600`
+permissions to:
 
 ```text
 ~/.config/u115-uploader/tokens.json
 ```
 
-后续上传会自动使用该登录态，不需要重复扫码。access token 临近过期时，
-程序会使用 refresh token 刷新并写回文件。
+Future uploads reuse this session automatically; no further scan is needed.
+When the access token nears expiry the program refreshes it with the
+refresh token and writes the new value back to the file.
 
-需要切换账号或强制重新扫码时：
+To switch accounts or force a fresh scan:
 
 ```bash
 u115 login --force
 ```
 
-将认证二维码同时导出为 PNG 图片：
+To export the login QR code as a PNG image at the same time:
 
 ```bash
 u115 login --force --qr-output ./115-login.png
 ```
 
-命令仍会在终端显示二维码，同时把同一个二维码写入指定图片。输出目录不存在时会自动创建。
-如果已有有效登录态且未指定 `--force`，不会重新申请二维码，因此也不会生成图片。
+The QR code is still rendered in the terminal and additionally written to
+the requested image. The output directory is created if it does not
+exist. If a valid session already exists and `--force` is omitted, no
+fresh QR code is requested and therefore no image is produced.
 
-使用自定义登录态文件：
+To use a custom token file:
 
 ```bash
 u115 login --tokens /secure/path/115-tokens.json
 ```
 
-也可以通过环境变量统一指定：
+The path can also be set globally via an environment variable:
 
 ```bash
 export U115_TOKEN_PATH=/secure/path/115-tokens.json
 u115 login
 ```
 
-## 上传
+## Upload
 
-上传到根目录：
+Upload to the root directory:
 
 ```bash
 u115 upload /path/to/input/sample.dat
 ```
 
-上传到指定的 115 目录路径：
+Upload to a specific 115 directory path:
 
 ```bash
 u115 upload /path/to/input/sample.dat --remote-dir "/remote-target/subdirectory"
 ```
 
-递归上传文件夹中的全部普通文件：
+Recursively upload every regular file inside a directory:
 
 ```bash
 u115 upload "/path/to/input-directory" --remote-dir "/remote-target/subdirectory"
 ```
 
-文件夹层级仅用于查找本地文件；所有文件仍上传到同一个 115 目标目录，不会自动创建远端子目录。
+The local directory hierarchy is used only for file discovery; every
+file is uploaded to the same 115 target directory and no remote
+subdirectories are created automatically.
 
-使用通配符上传；建议用引号阻止 Shell 提前展开，由程序统一处理 `*`、`?` 和
-递归匹配 `**`：
+Glob patterns are supported. Quote them to prevent the shell from
+expanding them early so the program can handle `*`, `?`, and recursive
+`**` consistently:
 
 ```bash
 u115 upload "/path/to/input/**/*.dat" --remote-dir "/remote-target"
 ```
 
-同一个文件被多个参数或模式重复匹配时只会上传一次。未匹配的通配符会显示跳过提示，
-并继续处理其他输入；如果全部通配符都未匹配，命令不会登录或上传，并返回退出码 `3`
-表示“没有工作”。不含通配符的路径不存在、文件夹为空时仍会明确报错。
+When the same file matches multiple arguments or patterns it is uploaded
+once. Patterns that match nothing are skipped with a notice and other
+inputs continue to be processed. If every pattern is unmatched, no
+login or upload occurs and the command exits with code `3` to indicate
+"no work". Paths without wildcards that simply do not exist, or empty
+directories, still produce an explicit error.
 
-空格、中文和通配符元字符等特殊字符文件名应使用引号。已存在的路径会优先按字面处理，
-因此下例中的方括号、星号和问号不会被当作通配符：
+File names that contain spaces, CJK characters, or glob metacharacters
+should be quoted. Paths that already exist on disk are resolved
+literally first, so brackets, asterisks, and question marks in the
+example below are not treated as wildcards:
 
 ```bash
 u115 upload "/path/to/input/sample [final]*?.dat"
 ```
 
-文件名以 `-` 开头时，在文件参数前使用 `--` 结束选项解析：
+For file names that begin with `-`, place `--` before the file argument
+to end option parsing:
 
 ```bash
-u115 upload -- "-特殊文件.txt"
+u115 upload -- "-special-file.txt"
 ```
 
-也支持把远端目录放在最后：
+You can also place the remote directory as the last argument:
 
 ```bash
 u115 upload "/path/to/input/sample-*.dat" /remote-target
 ```
 
-远端路径必须：
+Remote paths must:
 
-- 从根目录开始并以 `/` 开头。
-- 每一级目录都已经存在。
-- 目录名称完全匹配，包括空格和大小写。
+- Start at the root and begin with `/`.
+- Have every directory level already exist unless `--create-remote-dir`
+  is explicitly enabled.
+- Match directory names exactly, including spaces and case.
 
-如果某一级不存在或存在同名目录，命令会明确报错，不会擅自创建目录或上传到其他位置。
+By default, a missing level or name collision is an explicit error. For
+automated upload jobs that should create missing levels beneath an
+existing or newly created parent path, enable it explicitly:
 
-也可以直接指定目录 CID，并设置 64 MiB 分片：
+```bash
+u115 upload "/path/to/input/*.dat" \
+  --remote-dir "/withny/streamer-name" \
+  --create-remote-dir
+```
+
+The command reuses existing directories level by level and creates only
+missing levels. Duplicate sibling names, API failures, or a directory
+name rewritten by 115 remain hard errors; the upload never silently
+targets a different directory.
+
+You can also target a directory directly by CID with 64 MiB parts:
 
 ```bash
 u115 upload /path/to/input/sample.dat --cid 123456 --part-size 64
 ```
 
-`--remote-dir` 与 `--cid` 不能同时使用。不指定时上传到根目录。
+`--remote-dir` and `--cid` cannot be combined. When neither is given the
+file is uploaded to the root directory.
 
-每个文件上传后都会重新读取目标目录，并同时核对远端文件名、大小和 SHA1。只有三项
-完全一致才算完成。需要在强校验后删除本地源文件时，显式添加：
+After every upload the target directory is re-read and the remote file
+name, size, and SHA1 are re-checked. Only when all three match is the
+upload considered complete. To delete the local source after strong
+verification passes, add the flag explicitly:
 
 ```bash
 u115 upload "/path/to/input/*.dat" \
@@ -197,7 +241,8 @@ u115 upload "/path/to/input/*.dat" \
   --delete-source-after-verify
 ```
 
-更保守的做法是把已校验文件移动到本地归档目录：
+A more conservative approach is to move verified files into a local
+archive directory:
 
 ```bash
 u115 upload "/path/to/input/*.dat" \
@@ -205,14 +250,18 @@ u115 upload "/path/to/input/*.dat" \
   --move-source-after-verify "/path/to/processed"
 ```
 
-同名文件策略由 `--on-conflict` 控制：
+The same-name policy is controlled by `--on-conflict`:
 
-- `verify`：默认策略；大小和 SHA1 一致则跳过上传，不一致则报错。
-- `error`：发现同名文件立即报错。
-- `skip`：不校验直接跳过；不能与本地删除或移动选项一起使用。
-- `rename`：使用 `文件名 (N).扩展名` 上传，并对新名称执行强校验。
+- `verify` (default): skip the upload if the size and SHA1 already
+  match; raise an error otherwise.
+- `error`: raise immediately when a same-name file is found.
+- `skip`: skip without verifying; cannot be combined with the
+  delete/move-source options.
+- `rename`: upload as `name (N).ext` and run strong verification on the
+  new name.
 
-仅对网络传输错误进行有限重试，并把成功结果追加到 JSON Lines manifest：
+Network transport errors are retried a bounded number of times, and
+successful results are appended to a JSON Lines manifest:
 
 ```bash
 u115 upload "/path/to/input/*.dat" \
@@ -221,49 +270,54 @@ u115 upload "/path/to/input/*.dat" \
   --manifest "./upload-manifest.jsonl"
 ```
 
-callback、SHA1、冲突或其他业务错误不会重试，避免掩盖协议问题。
+Callback, SHA1, conflict, or other protocol errors are never retried so
+the underlying problem is never hidden.
 
-如果没有提前执行 `login`，第一次执行 `upload` 时也会自动显示二维码并等待登录。
+If `login` was not run beforehand, the first `upload` will automatically
+render the QR code and wait for login.
 
-上传时使用自定义登录态文件：
+To use a custom token file when uploading:
 
 ```bash
 u115 upload /path/to/input/sample.dat --tokens /secure/path/115-tokens.json
 ```
 
-## 独立校验
+## Verification Only
 
-不上传，只确认本地文件是否已经完整存在于指定 115 目录：
+Without uploading, confirm whether a local file already exists
+completely in the target 115 directory:
 
 ```bash
 u115 verify "/path/to/input/sample.dat" --remote-dir "/remote-target"
 ```
 
-`verify` 同样支持 `--cid`、通配符和 `--manifest`。
+`verify` also supports `--cid`, glob patterns, and `--manifest`.
 
-## 统一列表、搜索与重复文件
+## Unified Listing, Search, and Duplicates
 
-`list` 统一输出文件和文件夹：
+`list` outputs files and folders together:
 
 ```bash
 u115 list "/remote-target"
 u115 list --cid 123456
 ```
 
-默认最多输出 100 条，达到上限后立即停止继续读取文件分页或后续递归目录。可调整单次
-输出上限：
+By default at most 100 entries are emitted, and the command stops as
+soon as that limit is reached without reading further file pages or
+recursing into more directories. Adjust the per-call cap with:
 
 ```bash
 u115 list "/remote-target" --limit 500
 ```
 
-确实需要读取当前范围内全部条目时，必须显式允许：
+To deliberately read every entry in the current scope, opt in
+explicitly:
 
 ```bash
 u115 list "/remote-target" --all
 ```
 
-按类型筛选，或递归读取全部后代：
+Filter by type or recurse into all descendants:
 
 ```bash
 u115 list "/remote-target" --type file
@@ -271,40 +325,44 @@ u115 list "/remote-target" --type folder --recursive
 u115 list "/remote-target" --type all --recursive
 ```
 
-递归默认最多深入 20 层，可按目录结构收紧：
+Recursive listings default to 20 levels deep; tighten that for shallow
+trees:
 
 ```bash
 u115 list "/remote-target" --recursive --max-depth 5
 ```
 
-为避免只有少量文件但目录树极大的场景产生无界请求，目录扫描默认最多 1000 个。确实
-需要扫描更大的目录树时显式提高：
+To prevent unbounded requests when a tree is enormous but contains few
+files, directory scans default to 1000 directories. Raise that cap
+explicitly when needed:
 
 ```bash
 u115 list "/remote-target" --recursive --max-directories 5000
 ```
 
-在整个账号中搜索：
+Search across the entire account:
 
 ```bash
 u115 list --search "sample-keyword"
 u115 list --search ".dat" --type file
 ```
 
-按 SHA1 输出当前范围内的重复文件：
+Report duplicate files in the current scope by SHA1:
 
 ```bash
 u115 list "/remote-target" --type file --duplicates --all
 u115 list "/remote-target" --recursive --duplicates --all
 ```
 
-`--duplicates` 需要完整结果才能正确分组，因此强制要求同时指定 `--all`；它只报告，
-不自动删除。统一输出为 Tab 分隔的 `TYPE`、`ID`、
-`PARENT_ID`、`SIZE`、`SHA1`、`NAME` 六列；文件夹的大小和 SHA1 为空。
+`--duplicates` requires the full result set to group correctly, so it
+forces `--all`. It only reports duplicates; it never deletes them. The
+output is always six tab-separated columns: `TYPE`, `ID`, `PARENT_ID`,
+`SIZE`, `SHA1`, `NAME`. Folders have empty size and SHA1 columns.
 
-## 删除到回收站
+## Trash Deletion
 
-远端删除使用精确文件 ID，并移动到 115 回收站：
+Remote deletion uses precise file IDs and moves files into the 115
+trash:
 
 ```bash
 u115 delete <FILE_ID> \
@@ -312,18 +370,21 @@ u115 delete <FILE_ID> \
   --yes
 ```
 
-`delete` 不接受文件名或模糊搜索，必须同时提供文件当前父 CID 和 `--yes`；它不会执行
-回收站永久清空。可先通过 `list` 取得精确 ID 和父 CID。
+`delete` accepts neither file names nor fuzzy searches. It requires the
+file's current parent CID and `--yes`. It never empties the trash
+permanently. Use `list` first to look up the exact ID and parent CID.
 
-## 退出码
+## Exit Codes
 
-- `0`：请求的操作全部完成，或远端强校验一致后跳过上传。
-- `1`：文件系统、网络、115 协议或强校验失败。
-- `2`：命令参数错误。
-- `3`：通配符全部未匹配，没有执行任何操作。
-- `130`：用户中断。
+- `0`: every requested operation completed, or a remote strong
+  verification succeeded and the upload was skipped.
+- `1`: filesystem, network, 115 protocol, or strong verification
+  failure.
+- `2`: invalid command arguments.
+- `3`: every glob was unmatched and nothing was done.
+- `130`: interrupted by the user.
 
-查看完整参数：
+See the full option list with:
 
 ```bash
 u115 --help
@@ -334,8 +395,12 @@ u115 list --help
 u115 delete --help
 ```
 
-## 测试
+## Testing
 
 ```bash
 uv run pytest
 ```
+
+## License
+
+Released under the [MIT License](./LICENSE).
