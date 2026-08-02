@@ -161,6 +161,7 @@ def test_extended_command_parsers_expose_safe_workflow_options() -> None:
             "--delete-source-after-verify",
             "--retry",
             "2",
+            "--create-remote-dir",
         ]
     )
     default_upload = parser.parse_args(["upload", "folder", "--remote-dir", "/备份"])
@@ -169,6 +170,7 @@ def test_extended_command_parsers_expose_safe_workflow_options() -> None:
     assert upload.on_conflict == "rename"
     assert upload.delete_source_after_verify is True
     assert upload.retry == 2
+    assert upload.create_remote_dir is True
     assert default_upload.on_conflict == "verify"
     assert delete.yes is True
 
@@ -340,8 +342,8 @@ def test_upload_continues_after_single_file_failure_and_returns_nonzero(
         def __init__(self, access_token: str) -> None:
             assert access_token == "access"
 
-        def resolve_remote_dir(self, remote_dir: str) -> int:
-            """返回固定测试 CID。"""
+        def ensure_remote_dir(self, remote_dir: str) -> int:
+            """模拟自动创建并返回固定测试 CID。"""
             assert remote_dir == "/target"
             return 9
 
@@ -363,6 +365,7 @@ def test_upload_continues_after_single_file_failure_and_returns_nonzero(
         str(second),
         "--remote-dir",
         "/target",
+        "--create-remote-dir",
         "--manifest",
         str(manifest),
         "--tokens",

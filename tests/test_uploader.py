@@ -309,6 +309,39 @@ def test_resolve_remote_directory_path_level_by_level() -> None:
     assert requests[1].url.params["cid"] == "10"
 
 
+def test_ensure_remote_directory_creates_missing_child() -> None:
+    """自动目录解析应保留已有父目录，并通过 Open API 创建缺失子目录。"""
+    requests = []
+    responses = iter(
+        [
+            {
+                "state": True,
+                "count": 1,
+                "data": [{"cid": "10", "n": "withny"}],
+            },
+            {"state": True, "count": 0, "data": []},
+            {
+                "state": True,
+                "data": {"file_id": "20", "file_name": "財木桜"},
+            },
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """记录目录列表与创建请求。"""
+        requests.append(request)
+        return httpx.Response(200, json=next(responses))
+
+    uploader = OpenUploader(
+        "token",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert uploader.ensure_remote_dir("/withny/財木桜") == 20
+    assert requests[2].url.path == "/open/folder/add"
+    assert requests[2].content.decode() == "pid=10&file_name=%E8%B2%A1%E6%9C%A8%E6%A1%9C"
+
+
 def test_list_child_folders_uses_folder_only_filter_and_paginates() -> None:
     """目录列表应使用 nf=1，兼容两种字段形状并按 count 完整翻页。"""
     requests = []

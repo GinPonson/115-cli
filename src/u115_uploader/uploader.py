@@ -462,11 +462,7 @@ class OpenUploader:
             ValueError: 路径不是绝对路径或包含 ``..``。
             UploadError: 某一级目录不存在、重名或列表响应无效。
         """
-        if not remote_dir.startswith("/"):
-            raise ValueError("115 目录路径必须以 / 开头")
-        segments = [segment for segment in remote_dir.split("/") if segment not in ("", ".")]
-        if any(segment == ".." for segment in segments):
-            raise ValueError("115 目录路径不能包含 ..")
+        segments = self._remote_dir_segments(remote_dir)
         current_cid = 0
         traversed: list[str] = []
         for segment in segments:
@@ -479,6 +475,81 @@ class OpenUploader:
                 raise UploadError(f"115 目录存在同名项，无法唯一解析：{current_path}")
             current_cid = matches[0]
         return current_cid
+
+    def ensure_remote_dir(self, remote_dir: str) -> int:
+        """逐级解析远端目录，并创建缺失的中间层级。
+
+        Args:
+            remote_dir: 从根目录开始的绝对路径；``/`` 表示根目录。
+
+        Returns:
+            最后一层目录的 CID。
+
+        Raises:
+            ValueError: 路径或目录名称非法。
+            UploadError: 目录重名、创建失败或响应字段无效。
+        """
+        segments = self._remote_dir_segments(remote_dir)
+        current_cid = 0
+        traversed: list[str] = []
+        for segment in segments:
+            matches = self._find_child_folders(current_cid, segment)
+            traversed.append(segment)
+            current_path = "/" + "/".join(traversed)
+            if len(matches) > 1:
+                raise UploadError(f"115 目录存在同名项，无法唯一解析：{current_path}")
+            if matches:
+                current_cid = matches[0]
+                continue
+            created = self.create_folder(current_cid, segment)
+            if created.name != segment:
+                raise UploadError(
+                    f"115 创建目录后名称发生变化：{current_path} -> {created.name}"
+                )
+            current_cid = created.cid
+        return current_cid
+
+    def create_folder(self, parent_cid: int, name: str) -> RemoteFolder:
+        """在指定父目录下创建一个空文件夹。
+
+        Args:
+            parent_cid: 父目录 CID；根目录为 0。
+            name: 单层文件夹名称。
+
+        Returns:
+            115 返回的新文件夹条目。
+
+        Raises:
+            ValueError: CID 或文件夹名称非法。
+            UploadError: 创建请求失败或响应字段无效。
+        """
+        if parent_cid < 0:
+            raise ValueError("父目录 CID 不能为负数")
+        if not name or name in {".", ".."} or "/" in name or "\x00" in name:
+            raise ValueError("文件夹名称不能为空、.、..，且不能包含 / 或 NUL")
+        data = self._request_data(
+            "POST",
+            f"{PRO_API}/open/folder/add",
+            data={"pid": str(parent_cid), "file_name": name},
+        )
+        try:
+            folder_id = int(data["file_id"])
+            returned_name = str(data.get("file_name") or name)
+        except (KeyError, TypeError, ValueError) as error:
+            raise UploadError("115 新建文件夹响应字段无效") from error
+        if folder_id <= 0:
+            raise UploadError("115 新建文件夹返回了无效 CID")
+        return RemoteFolder(folder_id, parent_cid, returned_name)
+
+    @staticmethod
+    def _remote_dir_segments(remote_dir: str) -> list[str]:
+        """校验 115 绝对目录路径并返回有效层级。"""
+        if not remote_dir.startswith("/"):
+            raise ValueError("115 目录路径必须以 / 开头")
+        segments = [segment for segment in remote_dir.split("/") if segment not in ("", ".")]
+        if any(segment == ".." for segment in segments):
+            raise ValueError("115 目录路径不能包含 ..")
+        return segments
 
     def _find_child_folders(self, parent_cid: int, name: str) -> list[int]:
         """分页列出父目录，并返回名称完全匹配的子目录 CID。"""

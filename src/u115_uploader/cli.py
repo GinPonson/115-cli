@@ -304,8 +304,13 @@ def _add_upload_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--on-conflict",
         choices=("error", "skip", "verify", "rename"),
-        default="error",
+        default="verify",
         help="远端同名文件策略，默认 verify",
+    )
+    parser.add_argument(
+        "--create-remote-dir",
+        action="store_true",
+        help="逐级创建 --remote-dir 中缺失的文件夹",
     )
     parser.add_argument(
         "--retry",
@@ -701,11 +706,12 @@ def run(argv: Sequence[str] | None = None) -> int:
             raise ValueError("skip 未执行 SHA1 校验，不能据此删除或移动本地源文件")
         tokens = load_tokens(token_path)
         uploader = OpenUploader(tokens.access_token)
-        parent_cid = (
-            args.cid
-            if args.cid is not None
-            else uploader.resolve_remote_dir(args.remote_dir or "/")
-        )
+        if args.cid is not None:
+            parent_cid = args.cid
+        elif args.create_remote_dir:
+            parent_cid = uploader.ensure_remote_dir(args.remote_dir or "/")
+        else:
+            parent_cid = uploader.resolve_remote_dir(args.remote_dir or "/")
         failed_count = 0
         for index, source in enumerate(sources, start=1):
             if len(sources) > 1:
