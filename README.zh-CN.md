@@ -125,6 +125,52 @@ export U115_TOKEN_PATH=/secure/path/115-tokens.json
 u115 login
 ```
 
+### 选择开放平台应用身份
+
+115 开放平台以「应用」为授权主体，不同 AppID 拥有独立的授权记录与权限范围。
+登录前可先查看内置的应用清单：
+
+```bash
+u115 list-apps
+```
+
+输出为「AppID + 应用名称」，默认应用带 `（默认）` 标记：
+
+```text
+100195125	媒体播放器
+100195137	VidHub 播放器（默认）
+100195303	OpenList
+...
+```
+
+登录时用 `--client-id` 指定应用，取值可以是 AppID 或应用名称（名称不区分大小写）：
+
+```bash
+u115 login --force --client-id 100195303
+u115 login --force --client-id OpenList
+```
+
+两点行为需要明确：
+
+- `--client-id` **只在需要新登录时生效**。已有有效登录态时命令会直接复用，
+  不会因为传入该参数而重新授权；要真正切换身份请配合 `--force`。
+- 传入未收录的 AppID 会立即报错并列出全部可用值，不会静默回退到默认应用。
+
+登录成功后命令会回显实际使用的应用身份，便于确认：
+
+```text
+登录成功：你的昵称
+应用身份：OpenList（100195303）
+登录态已保存：/home/user/.config/u115-uploader/tokens.json
+```
+
+不同应用身份建议配合不同登录态文件隔离：
+
+```bash
+u115 login --force --client-id OpenList --tokens ~/.config/u115-uploader/openlist.json
+u115 whoami --tokens ~/.config/u115-uploader/openlist.json
+```
+
 ## 上传
 
 上传到根目录：
@@ -422,6 +468,7 @@ u115 offline quota
 ```bash
 u115 --help
 u115 login --help
+u115 list-apps --help
 u115 upload --help
 u115 verify --help
 u115 list --help

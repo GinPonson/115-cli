@@ -145,6 +145,55 @@ export U115_TOKEN_PATH=/secure/path/115-tokens.json
 u115 login
 ```
 
+### Choosing an Open Platform app identity
+
+The 115 Open Platform authorizes per *app*, and each AppID keeps its own
+authorization record and permission scope. List the built-in catalog first:
+
+```bash
+u115 list-apps
+```
+
+Each line is `AppID<TAB>app name`, and the default app is marked `(default)`:
+
+```text
+100195125	媒体播放器
+100195137	VidHub 播放器 (default)
+100195303	OpenList
+...
+```
+
+Select an app for login with `--client-id`. It accepts either the AppID or the
+app name (case-insensitive):
+
+```bash
+u115 login --force --client-id 100195303
+u115 login --force --client-id OpenList
+```
+
+Two behaviours are worth calling out:
+
+- `--client-id` **only takes effect when a new login is required**. An existing
+  valid session is reused as-is, so pair it with `--force` when you actually
+  want to switch identity.
+- An unknown AppID fails immediately and lists every valid value; it never
+  silently falls back to the default app.
+
+The command echoes the app identity actually used, so the result is verifiable:
+
+```text
+登录成功：your-name
+应用身份：OpenList（100195303）
+登录态已保存：/home/user/.config/u115-uploader/tokens.json
+```
+
+Keep different identities isolated with separate token files:
+
+```bash
+u115 login --force --client-id OpenList --tokens ~/.config/u115-uploader/openlist.json
+u115 whoami --tokens ~/.config/u115-uploader/openlist.json
+```
+
 ## Upload
 
 Upload to the root directory:
@@ -487,6 +536,7 @@ See the full option list with:
 ```bash
 u115 --help
 u115 login --help
+u115 list-apps --help
 u115 upload --help
 u115 verify --help
 u115 list --help

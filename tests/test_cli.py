@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from u115_uploader import cli
+from u115_uploader.auth import OAuthTokens
 from u115_uploader.uploader import (
     DownloadLink,
     OfflineUrlResult,
@@ -428,6 +429,71 @@ def test_whoami_prints_account_summary(
     assert "5.00 TiB" in captured.out
     assert "1.00 TiB" in captured.out
     assert "年费VIP" in captured.out
+
+
+def test_list_apps_prints_catalog_without_touching_tokens(capsys) -> None:
+    """list-apps 应输出全部应用身份，且不读取登录态即可运行。"""
+    exit_code = cli.run(["list-apps"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    lines = [line for line in captured.out.splitlines() if line.strip()]
+    assert len(lines) == len(cli.CLIENT_APPS)
+    # 默认应用必须有显式标记，避免用户误判当前使用的是哪个身份。
+    assert any("100195137" in line and "默认" in line for line in lines)
+    assert any("100195303" in line and "OpenList" in line for line in lines)
+
+
+def test_login_parser_accepts_client_id_option() -> None:
+    """login 必须暴露 --client-id 选项，供用户指定开放平台应用身份。"""
+    parser = cli.build_parser()
+
+    default_login = parser.parse_args(["login"])
+    custom_login = parser.parse_args(["login", "--client-id", "100195303"])
+
+    assert default_login.client_id is None
+    assert custom_login.client_id == "100195303"
+
+
+def test_login_passes_resolved_client_id_to_auth(monkeypatch, tmp_path: Path) -> None:
+    """--client-id 传应用名称时，也必须解析成 AppID 再交给认证客户端。"""
+    captured = {}
+    # TokenStore.save 依赖真实 dataclass，替身必须返回 OAuthTokens 实例。
+    tokens = OAuthTokens("access", "refresh", 4102444800, 1, "tester")
+
+    class FakeAuth:
+        """记录 client_id 的认证替身。"""
+
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def login(self, *, client_id):
+            captured["client_id"] = client_id
+            return tokens
+
+    monkeypatch.setattr(cli, "OpenAuthClient", FakeAuth)
+
+    exit_code = cli.run(
+        ["login", "--force", "--client-id", "OpenList", "--tokens", str(tmp_path / "t.json")]
+    )
+
+    assert exit_code == 0
+    assert captured["client_id"] == "100195303"
+
+
+def test_login_rejects_unknown_client_id(monkeypatch, tmp_path: Path) -> None:
+    """未知应用身份必须报错退出，不能静默回退到默认应用。"""
+    monkeypatch.setattr(
+        cli,
+        "OpenAuthClient",
+        lambda **_kwargs: pytest.fail("未知应用不应创建认证客户端"),
+    )
+
+    exit_code = cli.run(
+        ["login", "--force", "--client-id", "999999", "--tokens", str(tmp_path / "t.json")]
+    )
+
+    assert exit_code == 1
 
 
 def test_mkdir_ensures_remote_dir(

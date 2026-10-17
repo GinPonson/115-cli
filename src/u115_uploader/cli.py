@@ -10,7 +10,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Sequence
 
-from .auth import OpenAuthClient, TokenStore
+from .auth import (
+    CLIENT_APPS,
+    DEFAULT_CLIENT_ID,
+    OpenAuthClient,
+    TokenStore,
+    find_client_app,
+    resolve_client_app,
+)
 from .uploader import OpenUploader, RemoteFolder, format_safe_error
 from .workflow import (
     VerifiedUpload,
@@ -391,6 +398,16 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PNG",
         help="将认证二维码同时导出为 PNG 图片",
     )
+    login_parser.add_argument(
+        "--client-id",
+        metavar="APPID",
+        help="指定 115 开放平台应用身份（AppID 或应用名称），默认 100195137；"
+        "仅在需要新登录时生效，已有登录态不受影响",
+    )
+    list_apps_parser = subparsers.add_parser(
+        "list-apps",
+        help="列出可用于登录的 115 开放平台应用身份",
+    )
     upload_parser = subparsers.add_parser("upload", help="上传或校验并跳过已存在文件")
     _add_upload_options(upload_parser)
     upload_parser.set_defaults(on_conflict="verify")
@@ -598,6 +615,7 @@ def build_parser() -> argparse.ArgumentParser:
     # 父级参数，trash/offline 的多级子命令要在每一级叶子命令上分别声明。
     for command_parser in (
         login_parser,
+        list_apps_parser,
         upload_parser,
         verify_parser,
         list_parser,
@@ -650,16 +668,33 @@ def run(argv: Sequence[str] | None = None) -> int:
     token_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
+        if args.command == "list-apps":
+            # 只读命令：不读取也不写入任何登录态，便于未登录时先行查看可用身份。
+            for app in CLIENT_APPS:
+                marker = "（默认）" if app.client_id == DEFAULT_CLIENT_ID else ""
+                print(f"{app.client_id}\t{app.name}{marker}")
+            return 0
+
         if args.command == "login":
+            # 先校验应用身份再创建认证客户端：非法 AppID 不应产生任何网络副作用。
+            # 未指定 --client-id 时沿用默认应用，保持既有登录行为不变。
+            client_id = (
+                resolve_client_app(args.client_id).client_id
+                if args.client_id
+                else DEFAULT_CLIENT_ID
+            )
             store = TokenStore(token_path)
             auth = OpenAuthClient(qr_output=args.qr_output)
             if args.force:
-                tokens = auth.login()
+                tokens = auth.login(client_id=client_id)
                 store.save(tokens)
             else:
-                tokens = auth.ensure_tokens(store)
+                tokens = auth.ensure_tokens(store, client_id=client_id)
             identity = tokens.user_name or str(tokens.user_id) or "当前账号"
             print(f"登录成功：{identity}")
+            # 明确回显实际使用的应用身份，避免用户误以为 --client-id 已生效却复用了旧令牌。
+            app = find_client_app(client_id)
+            print(f"应用身份：{app.name}（{client_id}）" if app else f"应用身份：{client_id}")
             print(f"登录态已保存：{token_path}")
             return 0
 

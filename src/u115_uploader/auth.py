@@ -24,7 +24,51 @@ from typing import Any, Callable
 import httpx
 import qrcode
 
-CLIENT_ID = "100195137"
+@dataclass(frozen=True, slots=True)
+class ClientApp:
+    """115 开放平台应用身份。
+
+    应用身份决定设备码授权时使用的 ``client_id``，不同应用拥有独立的
+    授权记录与权限范围；令牌签发后刷新不再依赖该值。
+
+    Attributes:
+        client_id: 开放平台 AppID，作为设备码接口的 ``client_id`` 参数。
+        name: 面向用户展示的应用名称。
+    """
+
+    client_id: str
+    name: str
+
+
+# 115 开放平台已公开的应用身份。名称与 AppID 对齐 p115client 的 OPEN_APP_IDS，
+# 与 Sirius（CLIENT_APPS）和 StarVault（OpenAuthApps.All）保持一致，便于跨端识别同一身份。
+CLIENT_APPS: tuple[ClientApp, ...] = (
+    ClientApp("100195125", "媒体播放器"),
+    ClientApp("100195127", "蒙太奇播放器"),
+    ClientApp("100195129", "飞牛私有云-挂载"),
+    ClientApp("100195133", "恒星播放器"),
+    ClientApp("100195135", "网易爆米花"),
+    ClientApp("100195137", "VidHub 播放器"),
+    ClientApp("100195145", "Filebar"),
+    ClientApp("100195149", "DS Cloud"),
+    ClientApp("100195151", "PurePhoto"),
+    ClientApp("100195177", "CloudDrive2"),
+    ClientApp("100195181", "Infuse"),
+    ClientApp("100195199", "极空间"),
+    ClientApp("100195201", "Moon Player"),
+    ClientApp("100195213", "当贝播放器"),
+    ClientApp("100195225", "115生活 App"),
+    ClientApp("100195271", "飞牛私有云"),
+    ClientApp("100195295", "rclone 修改版"),
+    ClientApp("100195303", "OpenList"),
+    ClientApp("100195307", "115FileSync"),
+    ClientApp("100195313", "CloudDrive"),
+    ClientApp("100195389", "115开放平台"),
+)
+
+# 默认沿用 VidHub 播放器，保持既有登录行为不变。
+DEFAULT_CLIENT_ID = "100195137"
+
 CODE_VERIFIER = "0" * 64
 CODE_CHALLENGE = base64.b64encode(
     hashlib.sha256(CODE_VERIFIER.encode("ascii")).digest()
@@ -33,6 +77,49 @@ AUTH_BASE_URL = "https://qrcodeapi.115.com"
 REFRESH_URL = "https://passportapi.115.com/open/refreshToken"
 DEFAULT_QR_TTL_SECONDS = 5 * 60
 REFRESH_EARLY_SECONDS = 5 * 60
+
+
+def resolve_client_app(value: str) -> ClientApp:
+    """按 AppID 或应用名称解析开放平台应用身份。
+
+    Args:
+        value: 用户输入，可以是 ``100195125`` 这类 AppID，也可以是
+            ``媒体播放器`` 这类应用名称（忽略首尾空白，名称不区分大小写）。
+
+    Returns:
+        唯一匹配的应用身份。
+
+    Raises:
+        ValueError: 输入为空或未匹配任何已知应用；错误消息会列出全部可选 AppID，
+            避免用户凭猜测传入非法值后才在 115 侧看到晦涩错误。
+    """
+    candidate = value.strip()
+    if not candidate:
+        raise ValueError("client_id 不能为空")
+    for app in CLIENT_APPS:
+        if app.client_id == candidate:
+            return app
+    folded = candidate.casefold()
+    for app in CLIENT_APPS:
+        if app.name.casefold() == folded:
+            return app
+    available = "、".join(app.client_id for app in CLIENT_APPS)
+    raise ValueError(f"未知的 115 开放平台应用：{value}；可用 AppID：{available}")
+
+
+def find_client_app(client_id: str) -> ClientApp | None:
+    """按 AppID 精确查找应用身份。
+
+    Args:
+        client_id: 开放平台 AppID。
+
+    Returns:
+        匹配的应用身份；未收录时返回 ``None``，便于调用方展示原始 AppID。
+    """
+    for app in CLIENT_APPS:
+        if app.client_id == client_id:
+            return app
+    return None
 
 
 class AuthenticationError(RuntimeError):
@@ -143,11 +230,25 @@ class OpenAuthClient:
         self._output = output
         self._qr_output = qr_output.expanduser().resolve() if qr_output else None
 
-    def ensure_tokens(self, store: TokenStore) -> OAuthTokens:
-        """复用有效令牌、刷新即将过期令牌，或启动二维码登录。"""
+    def ensure_tokens(
+        self,
+        store: TokenStore,
+        *,
+        client_id: str = DEFAULT_CLIENT_ID,
+    ) -> OAuthTokens:
+        """复用有效令牌、刷新即将过期令牌，或启动二维码登录。
+
+        Args:
+            store: 令牌持久化文件。
+            client_id: 仅在需要新登录时使用的开放平台 AppID；已有令牌直接复用，
+                不会因为该参数变化而重新授权。
+
+        Returns:
+            有效的 ``OAuthTokens``。
+        """
         tokens = store.load()
         if tokens is None:
-            tokens = self.login()
+            tokens = self.login(client_id=client_id)
             store.save(tokens)
             return tokens
         if tokens.expires_at <= int(time.time()) + REFRESH_EARLY_SECONDS:
@@ -155,15 +256,32 @@ class OpenAuthClient:
             store.save(tokens)
         return tokens
 
-    def login(self, ttl_seconds: int = DEFAULT_QR_TTL_SECONDS) -> OAuthTokens:
-        """申请二维码并阻塞轮询，直到确认、拒绝或过期。"""
+    def login(
+        self,
+        ttl_seconds: int = DEFAULT_QR_TTL_SECONDS,
+        *,
+        client_id: str = DEFAULT_CLIENT_ID,
+    ) -> OAuthTokens:
+        """申请二维码并阻塞轮询，直到确认、拒绝或过期。
+
+        Args:
+            ttl_seconds: 二维码有效期，单位为秒。
+            client_id: 开放平台 AppID，决定本次授权记录归属的应用身份。
+
+        Returns:
+            换取到的 OAuth 令牌。
+
+        Raises:
+            ValueError: 有效期非正数。
+            AuthenticationError: 协议或业务状态错误。
+        """
         if ttl_seconds <= 0:
             raise ValueError("二维码有效期必须大于零")
         device = self._request_json(
             "POST",
             f"{AUTH_BASE_URL}/open/authDeviceCode",
             data={
-                "client_id": CLIENT_ID,
+                "client_id": client_id,
                 "code_challenge": CODE_CHALLENGE,
                 "code_challenge_method": "sha256",
             },
