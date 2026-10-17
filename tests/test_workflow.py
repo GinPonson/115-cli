@@ -12,6 +12,7 @@ from u115_uploader.uploader import (
 )
 from u115_uploader.workflow import (
     VerifiedUpload,
+    _is_retryable,
     append_failure_manifest,
     append_manifest,
     finalize_local_source,
@@ -193,3 +194,26 @@ def test_failure_manifest_records_safe_structured_error(tmp_path: Path) -> None:
     assert '"stage": "upload"' in content
     assert '"error_type": "UploadCredentialExpiredError"' in content
     assert "SecurityToken" not in content
+
+
+def test_is_retryable_terminates_on_self_referential_cause() -> None:
+    """异常链即使被人为构成自环，也必须有限步返回而不是死循环。
+
+    该场景在生产中出现过：``raise X from X`` 使 ``X.__cause__`` 指向自身，
+    遍历 ``__cause__`` 的实现会永久自旋，表现为进程 100% 单核空转。
+    """
+    error = UploadError("回调业务失败")
+    error.__cause__ = error
+
+    # 自环输入下必须返回 False，而不是无限循环。
+    assert _is_retryable(error) is False
+
+
+def test_is_retryable_still_detects_transport_error_in_chain() -> None:
+    """加固环检测后，正常异常链仍必须能识别可重试的网络错误。"""
+    import httpx
+
+    outer = UploadError("OSS 请求失败")
+    outer.__cause__ = httpx.ConnectError("boom")
+
+    assert _is_retryable(outer) is True

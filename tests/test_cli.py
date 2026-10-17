@@ -6,7 +6,17 @@ from types import SimpleNamespace
 import pytest
 
 from u115_uploader import cli
-from u115_uploader.uploader import RemoteFile, RemoteFilePage, RemoteFolder, UploadError
+from u115_uploader.uploader import (
+    DownloadLink,
+    OfflineUrlResult,
+    RemoteFile,
+    RemoteFilePage,
+    RemoteFolder,
+    TrashItem,
+    TrashPage,
+    UploadError,
+    UserInfo,
+)
 from u115_uploader.workflow import VerifiedUpload
 
 
@@ -379,3 +389,345 @@ def test_upload_continues_after_single_file_failure_and_returns_nonzero(
     content = manifest.read_text(encoding="utf-8")
     assert '"action": "failed"' in content
     assert '"action": "uploaded"' in content
+
+
+def test_whoami_prints_account_summary(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    """whoami 应输出身份、空间与会员概要。"""
+    tokens = SimpleNamespace(access_token="access")
+
+    class FakeUploader:
+        """返回固定用户信息的客户端替身。"""
+
+        def __init__(self, access_token: str) -> None:
+            assert access_token == "access"
+
+        def user_info(self) -> UserInfo:
+            """返回覆盖字符串与典型数值的用户信息。"""
+            return UserInfo(
+                user_id=12345,
+                user_name="测试用户",
+                total_size=5 * 1024**4,
+                remain_size=1024**4,
+                use_size=4 * 1024**4,
+                vip_level="年费VIP",
+                vip_expire=1800000000,
+            )
+
+    monkeypatch.setattr(cli, "load_tokens", lambda _path: tokens)
+    monkeypatch.setattr(cli, "OpenUploader", FakeUploader)
+
+    exit_code = cli.run(["whoami", "--tokens", str(tmp_path / "tokens.json")])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "测试用户（ID 12345）" in captured.out
+    assert "5.00 TiB" in captured.out
+    assert "1.00 TiB" in captured.out
+    assert "年费VIP" in captured.out
+
+
+def test_mkdir_ensures_remote_dir(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    """mkdir 应逐级创建目录并输出最终 CID。"""
+    tokens = SimpleNamespace(access_token="access")
+
+    class FakeUploader:
+        """记录目录创建请求的客户端替身。"""
+
+        def __init__(self, access_token: str) -> None:
+            assert access_token == "access"
+
+        def ensure_remote_dir(self, path: str) -> int:
+            """校验并返回固定测试 CID。"""
+            assert path == "/备份/照片"
+            return 7
+
+    monkeypatch.setattr(cli, "load_tokens", lambda _path: tokens)
+    monkeypatch.setattr(cli, "OpenUploader", FakeUploader)
+
+    exit_code = cli.run(
+        ["mkdir", "/备份/照片", "--tokens", str(tmp_path / "tokens.json")]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "目录已就绪：/备份/照片（CID 7）" in captured.out
+
+
+def test_move_resolves_destination_and_moves_entries(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    """move 应先解析目标目录再提交移动，并输出结果。"""
+    tokens = SimpleNamespace(access_token="access")
+    calls: list[tuple[list[int], int]] = []
+
+    class FakeUploader:
+        """记录移动请求的客户端替身。"""
+
+        def __init__(self, access_token: str) -> None:
+            assert access_token == "access"
+
+        def resolve_remote_dir(self, remote_dir: str) -> int:
+            """校验并返回固定目标 CID。"""
+            assert remote_dir == "/目标"
+            return 9
+
+        def move_entries(self, file_ids, to_cid: int) -> None:
+            """记录批量移动调用。"""
+            calls.append((list(file_ids), to_cid))
+
+    monkeypatch.setattr(cli, "load_tokens", lambda _path: tokens)
+    monkeypatch.setattr(cli, "OpenUploader", FakeUploader)
+
+    exit_code = cli.run(
+        ["move", "1", "2", "--remote-dir", "/目标", "--tokens", str(tmp_path / "t.json")]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert calls == [([1, 2], 9)]
+    assert "已移动 1, 2 -> CID 9" in captured.out
+
+
+def test_rename_rejects_invalid_name(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    """包含路径分隔符的新名称应作为失败退出，并给出可读错误。"""
+    tokens = SimpleNamespace(access_token="access")
+
+    class FakeUploader:
+        """模拟 SDK 对非法名称的拒绝。"""
+
+        def __init__(self, access_token: str) -> None:
+            assert access_token == "access"
+
+        def rename_entry(self, file_id: int, new_name: str) -> None:
+            """非法名称必须在这里被拒绝，不能到达 115。"""
+            raise ValueError("新名称不能为空、.、..，且不能包含 / 或 NUL")
+
+    monkeypatch.setattr(cli, "load_tokens", lambda _path: tokens)
+    monkeypatch.setattr(cli, "OpenUploader", FakeUploader)
+
+    exit_code = cli.run(["rename", "5", "a/b", "--tokens", str(tmp_path / "t.json")])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "新名称" in captured.err
+
+
+def test_trash_list_prints_entries(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    """trash list 应输出标准化表格列并附带条目计数。"""
+    tokens = SimpleNamespace(access_token="access")
+
+    class FakeUploader:
+        """返回单条回收站记录的客户端替身。"""
+
+        def __init__(self, access_token: str) -> None:
+            assert access_token == "access"
+
+        def list_trash_page(self, *, offset: int = 0, limit: int = 100) -> TrashPage:
+            """校验分页参数并返回固定条目。"""
+            assert (offset, limit) == (0, 100)
+            item = TrashItem(
+                trash_id="301",
+                name="删除的文件.bin",
+                is_folder=False,
+                size=2048,
+                deleted_time=1700000000,
+                parent_cid=9,
+                parent_name="媒体",
+                pick_code="pc",
+                status=0,
+            )
+            return TrashPage(items=(item,), offset=0, limit=limit, total=1, next_offset=None)
+
+    monkeypatch.setattr(cli, "load_tokens", lambda _path: tokens)
+    monkeypatch.setattr(cli, "OpenUploader", FakeUploader)
+
+    exit_code = cli.run(["trash", "list", "--tokens", str(tmp_path / "t.json")])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "TRASH_ID\tTYPE\tSIZE\tDELETED_AT\tPARENT\tNAME" in captured.out
+    assert "301\tfile\t2048\t" in captured.out
+    assert "媒体\t删除的文件.bin" in captured.out
+    assert "共 1 个回收站条目" in captured.err
+
+
+def test_trash_purge_requires_explicit_yes(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    """彻底删除回收站条目必须显式确认 --yes。"""
+    tokens = SimpleNamespace(access_token="access")
+
+    class FakeUploader:
+        """仅校验客户端装配，不执行删除。"""
+
+        def __init__(self, access_token: str) -> None:
+            assert access_token == "access"
+
+        def purge_trash(self, trash_ids) -> None:
+            """未确认时不应到达这里。"""
+            raise AssertionError("不应在缺少 --yes 时执行彻底删除")
+
+    monkeypatch.setattr(cli, "load_tokens", lambda _path: tokens)
+    monkeypatch.setattr(cli, "OpenUploader", FakeUploader)
+
+    exit_code = cli.run(["trash", "purge", "123", "--tokens", str(tmp_path / "t.json")])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "--yes" in captured.err
+
+
+def test_download_url_prints_only_the_url(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    """download-url 的标准输出应只有直链本身，便于脚本取用。"""
+    tokens = SimpleNamespace(access_token="access")
+
+    class FakeUploader:
+        """返回固定直链的客户端替身。"""
+
+        def __init__(self, access_token: str) -> None:
+            assert access_token == "access"
+
+        def download_url(self, file_id: int) -> DownloadLink:
+            """校验文件 ID 并返回固定直链。"""
+            assert file_id == 42
+            return DownloadLink(42, "a.bin", 3, "AA", "https://cdn/a.bin")
+
+    monkeypatch.setattr(cli, "load_tokens", lambda _path: tokens)
+    monkeypatch.setattr(cli, "OpenUploader", FakeUploader)
+
+    exit_code = cli.run(["download-url", "42", "--tokens", str(tmp_path / "t.json")])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.out.strip() == "https://cdn/a.bin"
+
+
+def test_offline_add_reports_failures_and_returns_nonzero(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    """部分链接失败时应逐条报告并以非零退出码汇总。"""
+    tokens = SimpleNamespace(access_token="access")
+
+    class FakeUploader:
+        """记录目标目录并返回混合结果的客户端替身。"""
+
+        def __init__(self, access_token: str) -> None:
+            assert access_token == "access"
+
+        def resolve_remote_dir(self, remote_dir: str) -> int:
+            """校验并返回固定保存目录。"""
+            assert remote_dir == "/下载"
+            return 9
+
+        def add_offline_urls(self, urls, *, wp_path_id: int):
+            """校验保存目录并返回一成一败的结果。"""
+            assert wp_path_id == 9
+            return [
+                OfflineUrlResult("magnet:a", "hash-a", True, ""),
+                OfflineUrlResult("magnet:b", "", False, "链接无效"),
+            ]
+
+    monkeypatch.setattr(cli, "load_tokens", lambda _path: tokens)
+    monkeypatch.setattr(cli, "OpenUploader", FakeUploader)
+
+    exit_code = cli.run(
+        [
+            "offline",
+            "add",
+            "magnet:a",
+            "magnet:b",
+            "--remote-dir",
+            "/下载",
+            "--tokens",
+            str(tmp_path / "t.json"),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "hash-a" in captured.out
+    assert "离线任务添加失败：magnet:b：链接无效" in captured.err
+
+
+def test_offline_clear_requires_explicit_yes(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    """清空离线任务必须显式确认 --yes。"""
+    tokens = SimpleNamespace(access_token="access")
+
+    class FakeUploader:
+        """仅校验客户端装配，不执行清空。"""
+
+        def __init__(self, access_token: str) -> None:
+            assert access_token == "access"
+
+        def clear_offline_tasks(self, *, flag: int = 1) -> None:
+            """未确认时不应到达这里。"""
+            raise AssertionError("不应在缺少 --yes 时清空离线任务")
+
+    monkeypatch.setattr(cli, "load_tokens", lambda _path: tokens)
+    monkeypatch.setattr(cli, "OpenUploader", FakeUploader)
+
+    exit_code = cli.run(["offline", "clear", "--tokens", str(tmp_path / "t.json")])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "--yes" in captured.err
+
+
+def test_offline_rm_delete_files_requires_yes(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    """删除任务并连带删源文件时必须显式确认 --yes。"""
+    tokens = SimpleNamespace(access_token="access")
+
+    class FakeUploader:
+        """仅校验客户端装配，不执行删除。"""
+
+        def __init__(self, access_token: str) -> None:
+            assert access_token == "access"
+
+        def delete_offline_task(self, info_hash: str, *, delete_files: bool = False) -> None:
+            """未确认时不应到达这里。"""
+            raise AssertionError("不应在缺少 --yes 时删除源文件")
+
+    monkeypatch.setattr(cli, "load_tokens", lambda _path: tokens)
+    monkeypatch.setattr(cli, "OpenUploader", FakeUploader)
+
+    exit_code = cli.run(
+        ["offline", "rm", "hash", "--delete-files", "--tokens", str(tmp_path / "t.json")]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "--yes" in captured.err

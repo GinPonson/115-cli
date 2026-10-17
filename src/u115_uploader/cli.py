@@ -6,6 +6,7 @@ import argparse
 import glob
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Sequence
 
@@ -266,6 +267,23 @@ def _terminal_field(value: object) -> str:
     )
 
 
+def _format_size(size: int) -> str:
+    """把字节数格式化为带二进制单位的可读文本。
+
+    Args:
+        size: 字节数。
+
+    Returns:
+        例如 ``1.50 GiB`` 的文本；小于 1 KiB 时保留整数字节。
+    """
+    value = float(size)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024:
+            return f"{size} B" if unit == "B" else f"{value:.2f} {unit}"
+        value /= 1024
+    return f"{value:.2f} PiB"
+
+
 def _add_destination_arguments(parser: argparse.ArgumentParser) -> None:
     """为需要目标目录的命令添加互斥路径/CID 参数。
 
@@ -278,6 +296,20 @@ def _add_destination_arguments(parser: argparse.ArgumentParser) -> None:
         "--remote-dir",
         metavar="PATH",
         help="115 目标目录绝对路径，例如 /备份/照片；默认根目录",
+    )
+
+
+def _add_tokens_argument(parser: argparse.ArgumentParser) -> None:
+    """为命令添加 OAuth 登录态文件参数。
+
+    Args:
+        parser: 要扩展的子命令解析器。
+    """
+    parser.add_argument(
+        "--tokens",
+        type=Path,
+        default=Path(os.environ.get("U115_TOKEN_PATH", DEFAULT_TOKEN_PATH)),
+        help="OAuth 登录态文件，可由 U115_TOKEN_PATH 覆盖",
     )
 
 
@@ -421,19 +453,172 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="确认执行回收站操作；缺少时拒绝执行",
     )
+    whoami_parser = subparsers.add_parser(
+        "whoami",
+        help="查看当前账号、空间与会员信息",
+    )
+    mkdir_parser = subparsers.add_parser("mkdir", help="逐级创建 115 远端目录")
+    mkdir_parser.add_argument(
+        "path",
+        metavar="PATH",
+        help="要创建的 115 目录绝对路径，例如 /备份/照片",
+    )
+    move_parser = subparsers.add_parser("move", help="移动文件或文件夹到目标目录")
+    move_parser.add_argument(
+        "file_ids",
+        nargs="+",
+        type=positive_integer,
+        help="要移动的文件（夹） ID",
+    )
+    _add_destination_arguments(move_parser)
+    copy_parser = subparsers.add_parser("copy", help="复制文件或文件夹到目标目录")
+    copy_parser.add_argument(
+        "file_ids",
+        nargs="+",
+        type=positive_integer,
+        help="要复制的文件（夹） ID",
+    )
+    _add_destination_arguments(copy_parser)
+    copy_parser.add_argument(
+        "--no-dupli",
+        action="store_true",
+        help="目标目录存在同名项时拒绝复制，而不是由 115 自动改名",
+    )
+    rename_parser = subparsers.add_parser("rename", help="重命名单个文件或文件夹")
+    rename_parser.add_argument("file_id", type=positive_integer, help="文件（夹） ID")
+    rename_parser.add_argument("new_name", help="新名称")
+    trash_parser = subparsers.add_parser("trash", help="管理 115 回收站")
+    trash_subparsers = trash_parser.add_subparsers(dest="trash_command", required=True)
+    trash_list_parser = trash_subparsers.add_parser("list", help="列出回收站条目")
+    trash_list_parser.add_argument(
+        "--limit",
+        type=positive_integer,
+        default=100,
+        help="最多输出的条目数，默认 100",
+    )
+    trash_list_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="显式允许读取并输出回收站全部条目",
+    )
+    trash_recover_parser = trash_subparsers.add_parser(
+        "recover",
+        help="把回收站条目恢复到原位置",
+    )
+    trash_recover_parser.add_argument(
+        "trash_ids",
+        nargs="+",
+        metavar="TRASH_ID",
+        help="回收站条目 ID",
+    )
+    trash_purge_parser = trash_subparsers.add_parser(
+        "purge",
+        help="彻底删除回收站条目，不可恢复",
+    )
+    trash_purge_parser.add_argument(
+        "trash_ids",
+        nargs="+",
+        metavar="TRASH_ID",
+        help="回收站条目 ID",
+    )
+    trash_purge_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="确认彻底删除；缺少时拒绝执行",
+    )
+    url_parser = subparsers.add_parser("download-url", help="获取文件下载直链")
+    url_parser.add_argument("file_id", type=positive_integer, help="文件 ID")
+    offline_parser = subparsers.add_parser(
+        "offline",
+        help="管理 115 云下载（离线下载）任务",
+    )
+    offline_subparsers = offline_parser.add_subparsers(
+        dest="offline_command",
+        required=True,
+    )
+    offline_add_parser = offline_subparsers.add_parser("add", help="添加链接离线任务")
+    offline_add_parser.add_argument(
+        "urls",
+        nargs="+",
+        metavar="URL",
+        help="HTTP/FTP/磁力/ED2K 链接，可一次提交多个",
+    )
+    _add_destination_arguments(offline_add_parser)
+    offline_bt_parser = offline_subparsers.add_parser(
+        "add-bt",
+        help="上传种子并添加 BT 离线任务",
+    )
+    offline_bt_parser.add_argument("torrent", type=Path, help="本地 .torrent 种子文件")
+    _add_destination_arguments(offline_bt_parser)
+    offline_bt_parser.add_argument(
+        "--wanted",
+        default="",
+        metavar="INDEX",
+        help="仅下载的文件下标，逗号分隔；默认全部文件",
+    )
+    offline_list_parser = offline_subparsers.add_parser("list", help="查看离线任务列表")
+    offline_list_parser.add_argument(
+        "--page",
+        type=positive_integer,
+        default=1,
+        help="任务列表页码，默认第 1 页",
+    )
+    offline_rm_parser = offline_subparsers.add_parser("rm", help="删除离线任务")
+    offline_rm_parser.add_argument(
+        "info_hashes",
+        nargs="+",
+        metavar="INFO_HASH",
+        help="任务 SHA1，可先用 offline list 查看",
+    )
+    offline_rm_parser.add_argument(
+        "--delete-files",
+        action="store_true",
+        help="同时删除任务已下载到网盘的源文件",
+    )
+    offline_rm_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="确认 --delete-files 的删除行为；缺少时拒绝执行",
+    )
+    offline_clear_parser = offline_subparsers.add_parser("clear", help="按类型清空离线任务")
+    offline_clear_parser.add_argument(
+        "--flag",
+        type=int,
+        choices=(0, 1, 2, 3, 4, 5),
+        default=1,
+        help="清除类型：0 已完成、1 全部、2 失败、3 进行中、4/5 同时删源文件；默认 1",
+    )
+    offline_clear_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="确认清空操作；缺少时拒绝执行",
+    )
+    offline_quota_parser = offline_subparsers.add_parser("quota", help="查看离线下载配额")
+    # --tokens 必须定义在最终执行命令的解析器上：argparse 的子解析器不会继承
+    # 父级参数，trash/offline 的多级子命令要在每一级叶子命令上分别声明。
     for command_parser in (
         login_parser,
         upload_parser,
         verify_parser,
         list_parser,
         delete_parser,
+        whoami_parser,
+        mkdir_parser,
+        move_parser,
+        copy_parser,
+        rename_parser,
+        url_parser,
+        trash_list_parser,
+        trash_recover_parser,
+        trash_purge_parser,
+        offline_add_parser,
+        offline_bt_parser,
+        offline_list_parser,
+        offline_rm_parser,
+        offline_clear_parser,
+        offline_quota_parser,
     ):
-        command_parser.add_argument(
-            "--tokens",
-            type=Path,
-            default=Path(os.environ.get("U115_TOKEN_PATH", DEFAULT_TOKEN_PATH)),
-            help="OAuth 登录态文件，可由 U115_TOKEN_PATH 覆盖",
-        )
+        _add_tokens_argument(command_parser)
     return parser
 
 
@@ -649,6 +834,178 @@ def run(argv: Sequence[str] | None = None) -> int:
             for file_id in args.file_ids:
                 uploader.trash_file(file_id, args.parent_cid)
                 print(f"已移入 115 回收站：{file_id}")
+            return 0
+
+        if args.command == "whoami":
+            tokens = load_tokens(token_path)
+            info = OpenUploader(tokens.access_token).user_info()
+            print(f"用户：{info.user_name or '未知'}（ID {info.user_id}）")
+            print(
+                f"空间：已用 {_format_size(info.use_size)} / "
+                f"共 {_format_size(info.total_size)}（剩余 {_format_size(info.remain_size)}）"
+            )
+            if info.vip_level:
+                expire = (
+                    datetime.fromtimestamp(info.vip_expire).strftime("%Y-%m-%d")
+                    if info.vip_expire > 0
+                    else "未知"
+                )
+                print(f"会员：{info.vip_level}（{expire} 到期）")
+            else:
+                print("会员：无")
+            return 0
+
+        if args.command == "mkdir":
+            tokens = load_tokens(token_path)
+            uploader = OpenUploader(tokens.access_token)
+            cid = uploader.ensure_remote_dir(args.path)
+            print(f"目录已就绪：{args.path}（CID {cid}）")
+            return 0
+
+        if args.command in {"move", "copy"}:
+            tokens = load_tokens(token_path)
+            uploader = OpenUploader(tokens.access_token)
+            to_cid = (
+                args.cid
+                if args.cid is not None
+                else uploader.resolve_remote_dir(args.remote_dir or "/")
+            )
+            if args.command == "move":
+                uploader.move_entries(args.file_ids, to_cid)
+                verb = "已移动"
+            else:
+                uploader.copy_entries(args.file_ids, to_cid, no_dupli=args.no_dupli)
+                verb = "已复制"
+            ids = ", ".join(str(file_id) for file_id in args.file_ids)
+            print(f"{verb} {ids} -> CID {to_cid}")
+            return 0
+
+        if args.command == "rename":
+            tokens = load_tokens(token_path)
+            uploader = OpenUploader(tokens.access_token)
+            uploader.rename_entry(args.file_id, args.new_name)
+            print(f"已重命名：{args.file_id} -> {args.new_name}")
+            return 0
+
+        if args.command == "trash":
+            tokens = load_tokens(token_path)
+            uploader = OpenUploader(tokens.access_token)
+            if args.trash_command == "list":
+                if args.all:
+                    items = uploader.list_all_trash()
+                else:
+                    items = list(uploader.list_trash_page(limit=args.limit).items)
+                print("TRASH_ID\tTYPE\tSIZE\tDELETED_AT\tPARENT\tNAME")
+                for item in items:
+                    deleted = (
+                        datetime.fromtimestamp(item.deleted_time).strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        )
+                        if item.deleted_time > 0
+                        else ""
+                    )
+                    print(
+                        f"{item.trash_id}\t{'folder' if item.is_folder else 'file'}\t"
+                        f"{'' if item.is_folder else item.size}\t{deleted}\t"
+                        f"{_terminal_field(item.parent_name)}\t{_terminal_field(item.name)}"
+                    )
+                print(f"共 {len(items)} 个回收站条目", file=sys.stderr)
+                return 0
+            if args.trash_command == "recover":
+                uploader.restore_trash(args.trash_ids)
+                for trash_id in args.trash_ids:
+                    print(f"已恢复回收站条目：{trash_id}")
+                return 0
+            if not args.yes:
+                raise ValueError("彻底删除回收站条目必须显式指定 --yes")
+            uploader.purge_trash(args.trash_ids)
+            for trash_id in args.trash_ids:
+                print(f"已彻底删除回收站条目：{trash_id}")
+            return 0
+
+        if args.command == "download-url":
+            tokens = load_tokens(token_path)
+            link = OpenUploader(tokens.access_token).download_url(args.file_id)
+            # 只输出直链本身，保持脚本管道可直接取用。
+            print(link.url)
+            return 0
+
+        if args.command == "offline":
+            tokens = load_tokens(token_path)
+            uploader = OpenUploader(tokens.access_token)
+            if args.offline_command == "add":
+                wp_path_id = (
+                    args.cid
+                    if args.cid is not None
+                    else uploader.resolve_remote_dir(args.remote_dir or "/")
+                )
+                failed = 0
+                for result in uploader.add_offline_urls(args.urls, wp_path_id=wp_path_id):
+                    if result.state:
+                        print(
+                            f"已添加离线任务：{result.url}"
+                            f"（info_hash={result.info_hash}）"
+                        )
+                    else:
+                        failed += 1
+                        print(
+                            f"离线任务添加失败：{result.url}："
+                            f"{result.message or '115 拒绝了该链接'}",
+                            file=sys.stderr,
+                        )
+                return 1 if failed else 0
+            if args.offline_command == "add-bt":
+                wp_path_id = (
+                    args.cid
+                    if args.cid is not None
+                    else uploader.resolve_remote_dir(args.remote_dir or "/")
+                )
+                info_hash = uploader.add_offline_torrent(
+                    args.torrent,
+                    wp_path_id=wp_path_id,
+                    wanted=args.wanted,
+                    # 与 upload 一致：进度单行覆盖，结束后补换行再输出结果。
+                    progress_output=lambda text: print(text, end="", flush=True),
+                )
+                print()
+                print(f"已添加 BT 离线任务：{args.torrent}（info_hash={info_hash}）")
+                return 0
+            if args.offline_command == "list":
+                page = uploader.list_offline_tasks_page(page=args.page)
+                status_names = {-1: "失败", 0: "等待", 1: "下载中", 2: "完成"}
+                print("STATUS\tPERCENT\tSIZE\tINFO_HASH\tNAME")
+                for task in page.tasks:
+                    print(
+                        f"{status_names.get(task.status, task.status)}\t"
+                        f"{task.percent_done}%\t{task.size}\t{task.info_hash}\t"
+                        f"{_terminal_field(task.name)}"
+                    )
+                print(
+                    f"第 {page.page}/{page.page_count} 页，共 {page.count} 个任务",
+                    file=sys.stderr,
+                )
+                return 0
+            if args.offline_command == "rm":
+                if args.delete_files and not args.yes:
+                    raise ValueError("同时删除已下载源文件必须显式指定 --yes")
+                for info_hash in args.info_hashes:
+                    uploader.delete_offline_task(
+                        info_hash,
+                        delete_files=args.delete_files,
+                    )
+                    suffix = "（含源文件）" if args.delete_files else ""
+                    print(f"已删除离线任务：{info_hash}{suffix}")
+                return 0
+            if args.offline_command == "clear":
+                if not args.yes:
+                    raise ValueError("清空离线任务必须显式指定 --yes")
+                uploader.clear_offline_tasks(flag=args.flag)
+                print("已清空离线任务")
+                return 0
+            quota = uploader.offline_quota()
+            print(
+                f"离线配额：剩余 {quota.surplus}，已用 {quota.used}，总量 {quota.count}"
+            )
             return 0
 
         if args.command == "verify":

@@ -14,6 +14,10 @@
 - 可显式逐级创建缺失的远端目录
 - 强校验成功后按需删除或归档本地源文件
 - 统一列出、递归搜索、重复文件检查和精确 ID 回收站操作
+- 账号、空间与会员概览；显式创建目录；按精确 ID 移动、复制、重命名
+- 回收站完整生命周期：列出、恢复原位置和显式彻底删除
+- 浏览器 UA 签名的下载直链，方便脚本取用
+- 115 云下载（离线下载）任务：链接与 BT 批量添加、列表、删除、配额和分类清空
 - JSON Lines manifest 审计记录和网络错误有限重试
 
 默认安全语义是：不存在则上传；同名且大小、SHA1 一致则跳过；同名但内容不一致则报错。
@@ -323,8 +327,87 @@ u115 delete <FILE_ID> \
   --yes
 ```
 
-`delete` 不接受文件名或模糊搜索，必须同时提供文件当前父 CID 和 `--yes`；它不会执行
-回收站永久清空。可先通过 `list` 取得精确 ID 和父 CID。
+`delete` 不接受文件名或模糊搜索，必须同时提供文件当前父 CID 和 `--yes`。可先通过
+`list` 取得精确 ID 和父 CID。
+
+`trash` 命令组管理 `delete` 产生的回收站条目：
+
+```bash
+u115 trash list --all
+u115 trash list --limit 50
+u115 trash recover <TRASH_ID> [<TRASH_ID> ...]
+u115 trash purge <TRASH_ID> [<TRASH_ID> ...] --yes
+```
+
+`trash list` 输出 `TRASH_ID`、`TYPE`、`SIZE`、`DELETED_AT`、`PARENT` 和 `NAME` 列。
+`trash recover` 把条目恢复到原位置；单个条目恢复失败会逐条报告，任一失败退出码为
+`1`。`trash purge` 彻底删除条目且不可恢复，因此必须显式指定 `--yes`。
+
+## 账号与目录管理
+
+查看当前身份、空间用量与会员状态：
+
+```bash
+u115 whoami
+```
+
+逐级创建缺失的远端目录（已存在的层级直接复用，不会重复创建）：
+
+```bash
+u115 mkdir "/备份/照片/2026"
+```
+
+## 移动、复制与重命名
+
+这些命令操作 `list` 取得的精确文件（夹） ID，不接受文件名或模糊搜索：
+
+```bash
+u115 move <FILE_ID> [<FILE_ID> ...] --remote-dir "/目标"
+u115 move <FILE_ID> --cid <CID>
+u115 copy <FILE_ID> [<FILE_ID> ...] --remote-dir "/目标"
+u115 copy <FILE_ID> --cid <CID> --no-dupli
+u115 rename <FILE_ID> "新名字.ext"
+```
+
+`--remote-dir` 与 `--cid` 互斥，目标目录必须已存在。`copy` 默认由 115 自动处理同名
+冲突；`--no-dupli` 表示同名时拒绝复制。`rename` 拒绝空名称、`.`/`..` 以及包含 `/`
+的名称。
+
+## 下载直链
+
+按文件 ID 输出经 CDN 签名的下载直链，stdout 只包含 URL 本身，可直接进入管道：
+
+```bash
+u115 download-url <FILE_ID>
+```
+
+文件夹没有下载直链，会明确报错。
+
+## 离线下载
+
+`offline` 命令组管理 115 云下载任务：
+
+```bash
+u115 offline add "https://example.com/file.iso" "magnet:?xt=..." \
+  --remote-dir "/下载"
+u115 offline add-bt "/path/to/sample.torrent" --remote-dir "/下载"
+u115 offline list --page 1
+u115 offline rm <INFO_HASH> [<INFO_HASH> ...]
+u115 offline rm <INFO_HASH> --delete-files --yes
+u115 offline clear --yes
+u115 offline clear --flag 0 --yes
+u115 offline quota
+```
+
+- `offline add` 提交一个或多个 HTTP/FTP/磁力/ED2K 链接；每个链接独立报告结果，
+  任一链接被拒绝则退出码为 `1`。
+- `offline add-bt` 把 `.torrent` 种子上传到保存目录，远端解析后创建 BT 任务；
+  可用 `--wanted` 传逗号分隔的文件下标以下载种子中的部分文件。
+- `offline list` 按页输出 `STATUS`、`PERCENT`、`SIZE`、`INFO_HASH` 和 `NAME` 列。
+- `offline rm` 删除任务；配合 `--delete-files --yes` 可同时删除已下载到网盘的源文件。
+- `offline clear` 按类型清空任务：`--flag` 支持 `0`（已完成）、`1`（全部，默认）、
+  `2`（失败）、`3`（进行中）以及 `4` / `5`（同 `0` / `1`，但同时删除对应源文件）。
+- `offline quota` 显示剩余、已用与总量配额。
 
 ## 退出码
 
@@ -343,6 +426,14 @@ u115 upload --help
 u115 verify --help
 u115 list --help
 u115 delete --help
+u115 whoami --help
+u115 mkdir --help
+u115 move --help
+u115 copy --help
+u115 rename --help
+u115 trash --help
+u115 download-url --help
+u115 offline --help
 ```
 
 ## 测试

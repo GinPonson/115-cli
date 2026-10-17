@@ -117,9 +117,13 @@ def _is_retryable(error: BaseException) -> bool:
         仅当异常链包含 ``httpx.TransportError`` 时返回 ``True``。
     """
     current: BaseException | None = error
-    while current is not None:
+    # 异常链理论上无环，但 raise X from X 一类写法会制造自环，使遍历永不终止。
+    # 记录已访问对象，保证本函数在最坏输入下仍然有限步返回。
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
         if isinstance(current, (httpx.TransportError, UploadCredentialExpiredError)):
             return True
+        visited.add(id(current))
         current = current.__cause__
     return False
 

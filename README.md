@@ -20,6 +20,13 @@ specified files to your 115 cloud drive.
   verification succeeds
 - Unified listing, recursive search, duplicate-file detection, and
   precise ID-based trash operations
+- Account, space, and VIP summary; explicit directory creation; and
+  ID-based move, copy, and rename
+- Full trash lifecycle: listing, restore to the original location, and
+  explicit permanent purge
+- Browser-UA-signed download direct links for scripting
+- 115 cloud download (offline) tasks: URL and BT batch adding, listing,
+  deletion, quota, and typed clearing
 - JSON Lines manifest audit trail and bounded retry on transient network
   errors
 
@@ -371,8 +378,99 @@ u115 delete <FILE_ID> \
 ```
 
 `delete` accepts neither file names nor fuzzy searches. It requires the
-file's current parent CID and `--yes`. It never empties the trash
-permanently. Use `list` first to look up the exact ID and parent CID.
+file's current parent CID and `--yes`. Use `list` first to look up the
+exact ID and parent CID.
+
+The `trash` command group manages what `delete` produced:
+
+```bash
+u115 trash list --all
+u115 trash list --limit 50
+u115 trash recover <TRASH_ID> [<TRASH_ID> ...]
+u115 trash purge <TRASH_ID> [<TRASH_ID> ...] --yes
+```
+
+`trash list` prints `TRASH_ID`, `TYPE`, `SIZE`, `DELETED_AT`, `PARENT`,
+and `NAME` columns. `trash recover` restores entries to their original
+location; per-entry failures are reported and the command exits `1` if
+any entry could not be restored. `trash purge` permanently deletes
+entries and is therefore gated behind `--yes`.
+
+## Account and Directory Management
+
+Show the current identity, space usage, and VIP status:
+
+```bash
+u115 whoami
+```
+
+Create missing remote directory levels explicitly (existing levels are
+reused, never duplicated):
+
+```bash
+u115 mkdir "/backup/photos/2026"
+```
+
+## Move, Copy, and Rename
+
+These commands operate on precise file or folder IDs obtained from
+`list`; they accept neither names nor fuzzy searches:
+
+```bash
+u115 move <FILE_ID> [<FILE_ID> ...] --remote-dir "/target"
+u115 move <FILE_ID> --cid <CID>
+u115 copy <FILE_ID> [<FILE_ID> ...] --remote-dir "/target"
+u115 copy <FILE_ID> --cid <CID> --no-dupli
+u115 rename <FILE_ID> "new-name.ext"
+```
+
+`--remote-dir` and `--cid` are mutually exclusive and the destination
+directory must already exist. By default 115 resolves same-name
+collisions during `copy` automatically; `--no-dupli` rejects the copy
+instead. `rename` rejects empty names, `.`/`..`, and names containing
+`/`.
+
+## Download Links
+
+Print a signed CDN download URL for one file ID. The URL is the only
+stdout output, so it can be piped directly:
+
+```bash
+u115 download-url <FILE_ID>
+```
+
+Folders have no download URL and produce an explicit error.
+
+## Offline Downloads
+
+The `offline` command group drives 115 cloud download tasks:
+
+```bash
+u115 offline add "https://example.com/file.iso" "magnet:?xt=..." \
+  --remote-dir "/downloads"
+u115 offline add-bt "/path/to/sample.torrent" --remote-dir "/downloads"
+u115 offline list --page 1
+u115 offline rm <INFO_HASH> [<INFO_HASH> ...]
+u115 offline rm <INFO_HASH> --delete-files --yes
+u115 offline clear --yes
+u115 offline clear --flag 0 --yes
+u115 offline quota
+```
+
+- `offline add` submits one or more HTTP/FTP/magnet/ED2K links; each
+  link is reported individually and any rejected link makes the command
+  exit `1`.
+- `offline add-bt` uploads the `.torrent` file into the save directory,
+  parses it remotely, and creates the BT task. Pass `--wanted` with
+  comma-separated file indexes to download only part of the torrent.
+- `offline list` prints `STATUS`, `PERCENT`, `SIZE`, `INFO_HASH`, and
+  `NAME` columns for one page.
+- `offline rm` removes tasks; combine with `--delete-files --yes` to
+  also delete the downloaded source files.
+- `offline clear` empties tasks by type: `--flag` accepts `0`
+  (completed), `1` (all, default), `2` (failed), `3` (running), and `4`
+  / `5` (same as `0` / `1` but also deleting source files).
+- `offline quota` shows remaining, used, and total quota.
 
 ## Exit Codes
 
@@ -393,6 +491,14 @@ u115 upload --help
 u115 verify --help
 u115 list --help
 u115 delete --help
+u115 whoami --help
+u115 mkdir --help
+u115 move --help
+u115 copy --help
+u115 rename --help
+u115 trash --help
+u115 download-url --help
+u115 offline --help
 ```
 
 ## Testing
