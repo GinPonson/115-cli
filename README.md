@@ -313,8 +313,27 @@ The same-name policy is controlled by `--on-conflict`:
 - `error`: raise immediately when a same-name file is found.
 - `skip`: skip without verifying; cannot be combined with the
   delete/move-source options.
-- `rename`: upload as `name (N).ext` and run strong verification on the
+- `rename`: upload as `name_N.ext` and run strong verification on the
   new name.
+- `dedupe`: verify size and SHA1 first; skip when they match, otherwise
+  upload as `name_N.ext` and leave the existing file untouched.
+
+`dedupe` targets the case where a streamer goes live twice on the same
+day under the same title: the recorder only inspects the local
+filesystem, cannot see the same-name file already on 115, so `verify`
+fails on every run. `dedupe` appends an incrementing suffix (`_1`, `_2`,
+`_3`, ...) and uploads, so nothing is overwritten and no new recording is
+lost:
+
+```bash
+u115 upload "/path/to/archive/*.mp4" \
+  --remote-dir "/rplay/archive" \
+  --on-conflict dedupe
+```
+
+The suffix is an **incrementing number**, matching the `_unique_path`
+convention used by the rplay-live-dl recorder, which keeps local and
+remote names easy to cross-reference.
 
 Network transport errors are retried a bounded number of times, and
 successful results are appended to a JSON Lines manifest:

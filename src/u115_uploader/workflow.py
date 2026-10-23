@@ -22,7 +22,7 @@ from .uploader import (
     format_safe_error,
 )
 
-ConflictPolicy = Literal["error", "skip", "verify", "rename"]
+ConflictPolicy = Literal["error", "skip", "verify", "rename", "dedupe"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,20 +88,26 @@ def find_verified_remote(
 
 
 def choose_remote_name(source: Path, existing: list[RemoteFile]) -> str:
-    """为 rename 冲突策略生成目标目录中不存在的稳定文件名。
+    """为冲突策略生成目标目录中不存在的稳定文件名。
+
+    后缀沿用录制侧（rplay-live-dl）的 ``_N`` 约定，让同一场直播在本地与远端
+    呈现一致的命名风格，便于人工对照排查。
 
     Args:
         source: 本地源文件，用于取得名称与扩展名。
         existing: 目标目录中的直接文件。
 
     Returns:
-        原名或 ``name (N).suffix`` 形式的不冲突名称。
+        原名或 ``name_N.suffix`` 形式的不冲突名称。
+
+    Raises:
+        UploadError: 序号用尽仍无法生成不冲突名称。
     """
     names = {item.name for item in existing}
     if source.name not in names:
         return source.name
     for index in range(1, 10000):
-        candidate = f"{source.stem} ({index}){source.suffix}"
+        candidate = f"{source.stem}_{index}{source.suffix}"
         if candidate not in names:
             return candidate
     raise UploadError(f"无法为远端文件生成不冲突名称：{source.name}")
@@ -171,6 +177,24 @@ def upload_and_verify(
             )
             return VerifiedUpload(source, remote, False, False)
         if conflict == "rename":
+            remote_name = choose_remote_name(source, existing)
+        elif conflict == "dedupe":
+            # 先按大小与 SHA1 强校验：内容一致说明此前已成功上传，直接复用远端条目，
+            # 避免重复上传。仅当同名但内容不同（典型场景是同一主播同日同标题的二次
+            # 开播，录制侧只查本地文件系统、看不到远端已存在同名文件）才追加 _N 后缀
+            # 上传，既不覆盖既有文件，也不丢弃新录制的内容。
+            expected_size = source.stat().st_size
+            expected_sha1, _ = _hash_file(source)
+            match = next(
+                (
+                    item
+                    for item in same_name
+                    if item.size == expected_size and item.sha1 == expected_sha1
+                ),
+                None,
+            )
+            if match is not None:
+                return VerifiedUpload(source, match, False, False)
             remote_name = choose_remote_name(source, existing)
         else:
             raise UploadError(f"115 目标目录已存在同名文件：{source.name}")

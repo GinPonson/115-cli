@@ -1,5 +1,6 @@
 """上传后强校验、冲突处理和本地清理测试。"""
 
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -103,8 +104,86 @@ def test_upload_and_verify_renames_conflicting_remote_file(tmp_path: Path) -> No
     )
 
     assert verified.uploaded is True
-    assert verified.remote.name == "video (1).mp4"
-    assert uploader.upload_calls == [(source, "video (1).mp4")]
+    assert verified.remote.name == "video_1.mp4"
+    assert uploader.upload_calls == [(source, "video_1.mp4")]
+
+
+def test_dedupe_skips_when_remote_content_already_matches(tmp_path: Path) -> None:
+    """dedupe 策略下同名且 SHA1 一致时必须跳过，不能重复上传。"""
+    source = tmp_path / "video.mp4"
+    source.write_bytes(b"same")
+    sha1 = hashlib.sha1(b"same").hexdigest().upper()
+    uploader = FakeWorkflowUploader(
+        [RemoteFile(1, 9, "video.mp4", source.stat().st_size, sha1)]
+    )
+
+    verified = upload_and_verify(
+        uploader,
+        source,
+        parent_cid=9,
+        part_size=1024,
+        conflict="dedupe",
+        retries=0,
+        progress_output=lambda _text: None,
+    )
+
+    assert verified.uploaded is False
+    assert verified.remote.file_id == 1
+    # 关键：内容已存在，不得触发任何上传。
+    assert uploader.upload_calls == []
+
+
+def test_dedupe_uploads_with_suffix_when_content_differs(tmp_path: Path) -> None:
+    """dedupe 策略下同名但内容不同时必须追加 _N 后缀上传，两份都要保留。
+
+    回归背景：同一主播同日两次开播、标题相同，录制侧只检查本地文件系统，
+    看不到远端已有同名文件，导致每日上传失败且新录制内容无法入库。
+    """
+    source = tmp_path / "video.mp4"
+    source.write_bytes(b"second-stream")
+    uploader = FakeWorkflowUploader(
+        [RemoteFile(1, 9, "video.mp4", 999, "FIRSTSTREAMSHA1")]
+    )
+
+    verified = upload_and_verify(
+        uploader,
+        source,
+        parent_cid=9,
+        part_size=1024,
+        conflict="dedupe",
+        retries=0,
+        progress_output=lambda _text: None,
+    )
+
+    assert verified.uploaded is True
+    assert verified.remote.name == "video_1.mp4"
+    assert uploader.upload_calls == [(source, "video_1.mp4")]
+    # 原远端条目必须仍然存在，不能被覆盖。
+    assert any(item.file_id == 1 for item in uploader.files)
+
+
+def test_dedupe_picks_next_free_suffix(tmp_path: Path) -> None:
+    """已存在 _1 时必须顺延到 _2，避免覆盖先前归档的场次。"""
+    source = tmp_path / "video.mp4"
+    source.write_bytes(b"third-stream")
+    uploader = FakeWorkflowUploader(
+        [
+            RemoteFile(1, 9, "video.mp4", 999, "SHA-A"),
+            RemoteFile(2, 9, "video_1.mp4", 999, "SHA-B"),
+        ]
+    )
+
+    verified = upload_and_verify(
+        uploader,
+        source,
+        parent_cid=9,
+        part_size=1024,
+        conflict="dedupe",
+        retries=0,
+        progress_output=lambda _text: None,
+    )
+
+    assert verified.remote.name == "video_2.mp4"
 
 
 def test_finalize_local_source_deletes_only_when_explicit(tmp_path: Path) -> None:

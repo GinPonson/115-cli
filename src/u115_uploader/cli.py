@@ -342,9 +342,9 @@ def _add_upload_options(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--on-conflict",
-        choices=("error", "skip", "verify", "rename"),
+        choices=("error", "skip", "verify", "rename", "dedupe"),
         default="verify",
-        help="远端同名文件策略，默认 verify",
+        help="远端同名文件策略，默认 verify；dedupe 先强校验，内容不一致时追加 _N 后缀上传",
     )
     parser.add_argument(
         "--create-remote-dir",
