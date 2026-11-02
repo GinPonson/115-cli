@@ -17,12 +17,18 @@ import json
 import os
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import httpx
 import qrcode
+
+try:  # POSIX 提供 flock；Windows 上缺失时退化为无锁（不影响单进程正确性）。
+    import fcntl
+except ImportError:  # pragma: no cover - 仅 Windows 触发
+    fcntl = None  # type: ignore[assignment]
 
 @dataclass(frozen=True, slots=True)
 class ClientApp:
@@ -208,6 +214,32 @@ class TokenStore:
             temporary.unlink(missing_ok=True)
             raise
 
+    @contextmanager
+    def refresh_lock(self) -> Iterator[None]:
+        """跨进程串行化令牌刷新。
+
+        115 的 ``refresh_token`` 是一次性轮换的：多个进程同时用同一枚令牌刷新，
+        只有一个能成功，其余会把旧令牌用废，进而使整条令牌链失效。批量上传脚本
+        会连续拉起大量 ``u115 upload`` 子进程，一旦刷新窗口重叠就可能触发这种竞态。
+
+        在令牌文件旁边加一把 ``flock`` 排他锁，让刷新串行执行；拿不到 fcntl 的
+        平台（Windows）退化为不加锁，不改变单进程语义。
+        """
+        if fcntl is None:
+            yield
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self.path.with_name(f".{self.path.name}.lock")
+        descriptor = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
 
 class OpenAuthClient:
     """115 OAuth 设备码与刷新令牌客户端。"""
@@ -252,9 +284,41 @@ class OpenAuthClient:
             store.save(tokens)
             return tokens
         if tokens.expires_at <= int(time.time()) + REFRESH_EARLY_SECONDS:
-            tokens = self.refresh(tokens)
-            store.save(tokens)
+            tokens = self._refresh_serialized(store, tokens)
         return tokens
+
+    def _refresh_serialized(
+        self,
+        store: TokenStore,
+        stale: OAuthTokens,
+    ) -> OAuthTokens:
+        """在进程间锁内刷新，避免并发刷新把一次性 refresh_token 用废。
+
+        拿到锁后必须重新读取令牌文件：同一批上传会连续拉起大量 ``u115 upload``
+        子进程，前一个进程可能已经完成刷新并写回新的 refresh_token，此时后来的
+        进程应直接复用，而不是再用自己持有的旧令牌刷新一次。
+
+        Args:
+            store: 令牌持久化文件。
+            stale: 当前进程刷到锁之前读到的（即将过期的）令牌。
+
+        Returns:
+            仍有效的令牌，可能来自其他进程的最新写入。
+
+        Raises:
+            AuthenticationError: 刷新失败，例如 refresh_token 已失效。
+        """
+        with store.refresh_lock():
+            latest = store.load()
+            if (
+                latest is not None
+                and latest.expires_at > int(time.time()) + REFRESH_EARLY_SECONDS
+            ):
+                # 其他进程已完成刷新，直接复用，避免重复消费同一枚一次性令牌。
+                return latest
+            refreshed = self.refresh(latest or stale)
+            store.save(refreshed)
+            return refreshed
 
     def login(
         self,

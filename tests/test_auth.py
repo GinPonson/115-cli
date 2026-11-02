@@ -206,3 +206,67 @@ def test_ensure_tokens_reuses_existing_token_regardless_of_client_id(
     tokens = client.ensure_tokens(store, client_id="100195303")
 
     assert tokens.access_token == "access"
+
+
+def test_refresh_lock_creates_sidecar_lock_file(tmp_path: Path) -> None:
+    """刷新锁应在令牌文件旁创建独立的锁文件，便于跨进程 flock。"""
+    store = TokenStore(tmp_path / "tokens.json")
+
+    with store.refresh_lock():
+        pass
+
+    assert (tmp_path / ".tokens.json.lock").exists()
+
+
+def test_refresh_serialized_reuses_token_written_by_another_process(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """拿到锁后若发现别的进程已刷新出新令牌，必须直接复用而不是再刷一次。
+
+    115 的 refresh_token 一次性轮换，重复刷新会把令牌链用废，因此这条路径
+    是多进程批量上传下最关键的保护。
+    """
+    store = TokenStore(tmp_path / "tokens.json")
+    fresh = OAuthTokens("fresh-access", "fresh-refresh", int(time.time()) + 3600, 1, "tester")
+    # 模拟另一个进程刚刚完成刷新并写回。
+    store.save(fresh)
+    stale = OAuthTokens("old-access", "old-refresh", int(time.time()) - 10, 1, "tester")
+
+    client = OpenAuthClient(
+        http_client=httpx.Client(
+            transport=httpx.MockTransport(
+                lambda _request: pytest.fail("已有新令牌时不应发起刷新请求")
+            )
+        ),
+        output=lambda _message: None,
+    )
+    refreshed_calls: list[OAuthTokens] = []
+    monkeypatch.setattr(client, "refresh", lambda tokens: refreshed_calls.append(tokens) or fresh)
+
+    result = client._refresh_serialized(store, stale)
+
+    assert result == fresh
+    assert refreshed_calls == []
+
+
+def test_refresh_serialized_refreshes_and_persists_when_still_stale(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """锁内仍为过期令牌时应真正刷新，并把新令牌写回文件。"""
+    store = TokenStore(tmp_path / "tokens.json")
+    stale = OAuthTokens("old-access", "old-refresh", int(time.time()) - 10, 1, "tester")
+    store.save(stale)
+    fresh = OAuthTokens("new-access", "new-refresh", int(time.time()) + 3600, 1, "tester")
+
+    client = OpenAuthClient(
+        http_client=httpx.Client(transport=httpx.MockTransport(lambda _r: None)),
+        output=lambda _message: None,
+    )
+    monkeypatch.setattr(client, "refresh", lambda tokens: fresh)
+
+    result = client._refresh_serialized(store, stale)
+
+    assert result == fresh
+    assert store.load() == fresh
